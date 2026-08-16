@@ -141,7 +141,7 @@ FOV Circle TP >
 - ❌ **Infinite Ammo** (NOT WORKING)
 - ✅ **Instant Defib Charge**
 - ✅ **Max Defib Damage** - One-shot with defib
-- ❌ **Defib Range Multiplier** (NOT WORKING)
+- ❌ **Defib Range Multiplier** (NOT WORKING) (just use tp and use defib lol)
 - ❌ **Auto-Revive After TP** (NOT WORKING)
 
 ### Melee Enhancements
