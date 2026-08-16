@@ -20,9 +20,9 @@ FOV Circle TP >
 [![FOV Circle TP Preview](https://img.icons8.com/color/48/play--v1.png)](https://i.imgur.com/21FSchL.mp4)
 
 ---------------------------------
-# 🎮 Dirty Bomb Internal Cheat
+# 🎮 Dirty Bomb Internal Mod
 
-> **Full-featured internal cheat for Dirty Bomb with aimbot, ESP, teleport, and more!**
+> **Full-featured internal mod for Dirty Bomb with aimbot, ESP, teleport, and more!**
 
 ---
 
