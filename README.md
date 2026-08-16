@@ -172,3 +172,100 @@ FOV Circle TP >
 - 📊 **Message Counter**
 
 #### 40 Funny Messages Examples
+✅ "gaming chair just arrived" ✅ "is this game pay to win?" ✅ "how do i reload?" ✅ "instructions unclear, joined wrong team" ✅ "i played blindfolded" ✅ "my grandma plays better than you" ✅ "accidentally installed skill instead of game" ✅ "brb house is flooding" ✅ "playing on a microwave" ✅ "controller disconnected mid fight" ✅ "playing from mcdonalds wifi" ✅ "built different fr" ✅ "skill issue on your part" ✅ "playing with steering wheel" ✅ "instructions unclear got MVP" ✅ "alt tabbed and still won" ✅ "playing with monitor off" ✅ "packet loss made me god" ✅ "vpn to antarctica activated" ✅ "my toaster has better fps" ✅ "connection timeout saved me" ... and 19 more!
+
+
+### 🏷️ Clan Tag Changer
+
+#### Features
+- ✅ **Single Tag Mode** - One static clan tag
+- ✅ **Random Rotation** - Cycle through tags
+- ⏱️ **Rotation Interval** - 1 to 60 seconds
+- 🔢 **Active Tags** - Choose 1-10 tags to rotate
+
+#### Default Tags
+> Game automatically adds `[]` brackets!
+
+LEGIT | PRO | NOOB | GG | EZ LOL | WTF | OP | REKT | MLG
+
+
+---
+
+## 🛡️ Votekick Protection
+
+> ❌ **CURRENTLY NOT WORKING**
+
+### Intended Features
+- Auto-disconnect when votekicked
+- ProcessEvent hook detection
+- Memory scanner backup
+- Delay before disconnect (0-2s)
+- Ignore self-initiated votes
+- Status display with caller ID
+
+**Status**: Disabled - detection methods not functioning properly
+
+---
+
+## ⚙️ Configuration
+
+### Auto Config System
+- 💾 **Auto-Save** - Settings saved to `legit_config.ini`
+- 📂 **Auto-Load** - Loads on startup
+- 🔄 **Reset Config** - Restore defaults
+
+### Performance Optimizations
+- ⚡ **Cached ESP** - Names updated every 60 frames
+- 🎯 **Matrix Updates** - View-projection rebuilt every 5 frames
+- 🧵 **Background Threads** - Chat spam non-blocking
+- 🛡️ **Exception Handlers** - Crash prevention
+- ✅ **Pointer Validation** - Safe memory access
+- 🔒 **XOR Encryption** - Encrypted strings
+
+---
+
+## 🎹 Hotkeys
+
+| Key | Function |
+|-----|----------|
+| **INSERT** | Toggle menu visibility |
+| **F2** | Quick toggle EV/Turret targeting |
+| **Left Mouse** | Aimbot activation (default) |
+| **Right Mouse** | Teleport (default) |
+| **Mouse 4** | Auto Shoot |
+| **Mouse 5** | Real Triggerbot (not working) |
+
+> All hotkeys are customizable in the menu!
+
+---
+
+## 📦 Installation
+
+### Requirements
+- Windows 10/11 (x64)
+- Visual Studio 2019 or newer
+- DirectX 9
+- Dirty Bomb (latest version)
+
+
+⚠️ Disclaimer
+This project is for educational purposes only.
+
+Using cheats in online games violates Terms of Service
+May result in permanent bans
+Use at your own risk
+Author is not responsible for any consequences
+
+📊 Status
+✅	Fully working
+
+🤝 Contributing
+Feel free to:
+
+Report bugs
+Suggest features
+
+
+⭐ Star this repo if you found it helpful!
+
+Made with 💀 by the Dirty Bomb mod community
