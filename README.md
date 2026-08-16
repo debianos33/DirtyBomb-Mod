@@ -1,4 +1,4 @@
-You can use any injector you want; it doesn’t matter which one you use.
+[You can use any injector you want; it doesn’t matter which one you use.]
 
 
 - CROSSBOW / DEFIB / REVIVE GUN -
