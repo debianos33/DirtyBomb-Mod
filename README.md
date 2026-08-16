@@ -1,3 +1,1 @@
-2026 8/16/2026 HQ DIRTYBOMB MOD
-
-[![HQ DIRTYBOMB MOD Preview](https://img.icons8.com/color/96/play--v1.png)](https://i.imgur.com/Al5iabl.mp4)
+Crosshair TP SHOWCASE [VIDEO]https://i.imgur.com/Al5iabl.mp4[/VIDEO] Down Teammate TP > [VIDEO]https://i.imgur.com/KBldNLH.mp4[/VIDEO] FOV Circle TP > [VIDEO]https://i.imgur.com/21FSchL.mp4[/VIDEO]
