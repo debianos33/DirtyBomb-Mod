@@ -1,3 +1,6 @@
+You can use any injector you want; it doesn’t matter which one you use.
+
+
 - CROSSBOW / DEFIB / REVIVE GUN -
   
 While using the teleport, pair it with the crossbow, defib, or revive gun for extremely consistent, near-100% hit/revive accuracy.
