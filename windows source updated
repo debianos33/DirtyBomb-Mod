@@ -1,0 +1,3234 @@
+#include <windows.h>
+#include <stdint.h>
+#include <dwmapi.h>
+#include <math.h>
+#include <d3d9.h>
+#include <DirectXMath.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cstring>
+#include <cstdio>
+#include <cmath>
+
+using namespace DirectX;
+
+
+// Automated Scanning Data
+
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx9.h"
+#include "MinHook.h"
+
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "libMinHook.x64.lib")
+
+// --- Constants ---
+#define GWORLD_OFFSET           0x22361A0   
+#define EXCEPTION_INFO_PTR      0x222DE28   
+#define GNAMES_OFFSET           0x2236188
+#define UR_UNITS                10430.378f 
+#define RAD_TO_UR               65536.0f / (2.0f * 3.14159265f)
+#define UU_TO_DEG               360.0f / 65536.0f
+
+// --- Pawn / Weapon Offsets ---
+#define APAWN_WEAPON                0x940
+#define ASGPLAYERCONTROLLER_SGPAWN  0x17a8
+#define ACTOR_LOCATION              0x330
+#define ACTOR_ROTATION              0x33c
+#define AWEAPON_BMELEEWEAPON        0x674
+
+// --- Melee Offsets (from Linux source) ---
+#define SGMELEE_M_IMPACTPROXY            0x16ec
+#define SGMELEE_M_CURRENTACTIVEPROXY     0x16fc
+#define SGMELEE_M_MAXIMPACTPROXYHITDOT   0x1678
+#define SGMELEE_M_IMPACTPROXY_ARCHETYPE  0x1648
+#define IMPACTPROXY_MELECOLLISIONCOMP    0x528
+#define IMPACTPROXY_ATTACHMESH           0x534
+#define PRIMCOMP_TRANSLATION             0x210
+#define PRIMCOMP_SCALE                   0x228
+#define PRIMCOMP_SCALE3D                 0x22c
+#define PRIMCOMP_BOUNDSSCALE             0x238
+#define SKELCOMP_ATTACHMENTS             0x410
+#define FATTACHMENT_SIZE                 0x34
+#define FATTACHMENT_COMPONENT            0x0
+#define FATTACHMENT_BONENAME             0x8
+#define FATTACHMENT_RELLOC               0x10
+#define FATTACHMENT_RELROT               0x1c
+#define FATTACHMENT_RELSCALE             0x28
+
+// --- Weapon Fire Timing ---
+#define WEAPON_NEXTFIRETIME              0x13d0
+#define WEAPON_SPREADRECOVERYTIME        0x13d8
+#define WEAPON_FIREINTERVALMODIFIED      0x1574
+#define WEAPON_FIREINTERVALAUGMENTMOD    0x1594
+#define AWEAPON_FIREINTERVAL             0x610
+#define AWEAPON_FIREINTERVAL_COUNT_OFF   0x618
+#define ASGWEAPON_PROJECTILESPERSSHOT    0x920
+
+// --- Vote Kick Offsets (Linux source) ---
+#define PC_ACTIVE_VOTE                    0x17C8
+#define PC_M_SGPRI                        0x1BBC
+#define PC_DEVELOPER_CONSOLE_ENABLED      0x1450
+#define VOTE_M_BSYSTEMCALLED              0xC4
+#define VOTE_M_TARGETTOKICKID             0xF4
+#define PRI_PLAYER_ID                     0x558
+#define VOTEKICK_TIMER_MS                 30000
+
+// --- Camera Offsets ---
+#define ACAMERA_DEFAULTFOV                  0x540
+#define ACAMERA_LOCKEDFOV                   0x548
+#define ACAMERA_FADEAMOUNT                  0x560
+#define ACAMERA_CAMERACACHE_TIMESTAMP       0x690
+#define ACAMERA_POV_LOCATION                0x694
+#define ACAMERA_POV_ROTATION_PITCH          0x6A0
+#define ACAMERA_POV_ROTATION_YAW            0x6A4
+#define ACAMERA_POV_ROTATION_ROLL           0x6A8
+#define ACAMERA_POV_FOV                     0x6AC
+#define ASGCAMERA_THIRDPERSON_DISTANCE      0x870
+
+// --- Core Math ---
+struct FVector { float x, y, z; };
+struct FRotator { int pitch, yaw, roll; };
+struct FMatrix { float M[4][4]; };
+struct FBoneAtom {
+    float x, y, z, w;
+    float tx, ty, tz;
+    float scale;
+};
+struct FName {
+    int Index;
+    int Number;
+};
+
+struct Vector4 { float x, y, z, w; };
+struct Vector2 { float x, y; };
+struct Matrix4x4 { float M[4][4]; };
+
+typedef XMMATRIX Matrix;
+
+__forceinline FVector RotateVector(FVector v, float qx, float qy, float qz, float qw) {
+    FVector qv = { qx, qy, qz };
+    FVector t = {
+        2.0f * (qv.y * v.z - qv.z * v.y),
+        2.0f * (qv.z * v.x - qv.x * v.z),
+        2.0f * (qv.x * v.y - qv.y * v.x)
+    };
+    return {
+        v.x + qw * t.x + (qv.y * t.z - qv.z * t.y),
+        v.y + qw * t.y + (qv.z * t.x - qv.x * t.z),
+        v.z + qw * t.z + (qv.x * t.y - qv.y * t.x)
+    };
+}
+
+__forceinline FVector Cross(const FVector& a, const FVector& b) {
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+
+__forceinline FVector Normalize(const FVector& v) {
+    float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len < 0.001f) return v;
+    return { v.x / len, v.y / len, v.z / len };
+}
+
+__forceinline float URotToDeg(int32_t rot) {
+    return (float)rot * 360.0f / 65536.0f;
+}
+
+// --- Stealth Core: XOR Strings ---
+template <int N>
+class XorStr {
+public:
+    char data[N];
+    static const char key = 0x7F;
+    __forceinline XorStr(const char* s) { for (int i = 0; i < N; i++) data[i] = s[i] ^ key; }
+    __forceinline char* decrypt() { for (int i = 0; i < N; i++) data[i] ^= key; return data; }
+};
+#define X(str) (XorStr<sizeof(str)>(str).decrypt())
+
+// --- Globals ---
+uintptr_t g_Base = 0;
+uintptr_t g_PC = 0;
+int g_YawOff = 0;
+int g_HudOffset = 0x528;
+int g_CanvasOffset = 0x328;
+int g_CanvasMatrixOffset = 832;
+bool g_OffsetsFound = false;
+uintptr_t g_LastWorld = 0;
+DWORD g_MapStartTime = 0;
+float g_ScreenWidth = 1920.0f;
+float g_ScreenHeight = 1080.0f;
+
+// ProcessEvent Hook
+typedef void(__fastcall* f_ProcessEvent)(uintptr_t pObject, void* edx, uintptr_t pFunction, void* pParams, void* pResult);
+f_ProcessEvent oProcessEvent = nullptr;
+
+// ==================== SETTINGS ====================
+// Aimbot
+bool g_AimbotEnabled = true;
+bool g_SilentAim = false;
+float g_Smoothing = 15.0f;
+int g_SmoothType = 1; 
+float g_AimJitter = 0.5f;
+float g_ZOffset = 0.0f;
+int g_AimKey = VK_LBUTTON;
+float g_FovCircleRadius = 150.0f;
+bool g_FovCircleEnabled = true;
+bool g_TeamCheck = true;
+bool g_VisibleCheck = false;
+bool g_WasKeyDown = false;
+DWORD g_LastSilentAimTime = 0;
+int g_SilentAimCooldown = 50;
+bool g_ShowMenu = false;
+bool g_ThirdPerson = false;
+bool g_NoRecoil = true;
+bool g_NoSpread = true;
+float g_CustomSpreadValue = 0.0f;
+bool g_InfiniteLongJump = true;
+bool g_EspBox = true;
+bool g_EspHealth = true;
+bool g_EspBones = true;
+bool g_EspTeammates = true;
+bool g_EspNames = true;
+bool g_EspTracers = true;
+bool g_EspEnabled = true;
+int g_EnemyCount = 0;
+int g_DebugPawnCount = 0;
+int g_AimTargetBone = 1;
+const char* g_BoneNames[] = { "BONE EV/TURRET", "Body (Actual Head)", "Chest", "Eye Height + Offset" };
+
+// Bone toggle
+int g_BoneToggleKey = VK_F2;
+int g_SavedBoneMode = 1;
+bool g_BoneToggleKeyWasDown = false;
+
+// Third person
+float g_ThirdPersonDistance = 150.0f;
+
+// ==================== ONE HIT KILL ====================
+bool g_ProjectilesPerShotEnabled = false;
+int g_ProjectilesPerShotValue = 99;
+
+// ==================== MELEE ENHANCEMENTS (Linux-style) ====================
+bool g_MeleeRange = false;
+float g_MeleeBoundsScale = 2.3f;
+bool g_MeleeVisualScale = false;
+bool g_MeleeWideAngle = false;
+float g_MeleeHitDot = -1.0f;
+bool g_MeleePushForward = true;
+float g_MeleeForwardOffset = 2.3f;
+
+bool g_FastMelee = false;
+float g_MeleeFireInterval = 0.05f;
+bool g_FastMeleeForceNextFire = true;
+
+// Legacy melee (keep for backward compat)
+bool g_MeleeEnhanced = false;
+float g_BackstabMultiplier = 10.0f;
+int g_BackstabAngleSlider = 30;
+float g_MeleeReachMultiplier = 1.0f;
+
+// ==================== RAPID FIRE ====================
+bool g_RapidFire = false;
+float g_FireRate = 0.05f;
+
+// ==================== INFINITE AMMO ====================
+bool g_InfiniteAmmo = false;
+
+// ==================== DEFIB ENHANCEMENTS (legacy simple) ====================
+bool g_InstantDefibCharge = false;
+bool g_MaxDefibDamage = false;
+float g_DefibRangeMultiplier = 1.0f;
+
+// ==================== AUTO SHOOT ====================
+bool g_AutoShootEnabled = false;
+int g_AutoShootKey = VK_XBUTTON1;
+int g_AutoShootDelay = 50;
+bool g_AutoShootTeamCheck = true;
+bool g_AutoShootToggleMode = false;
+DWORD g_LastAutoShootShot = 0;
+
+// ==================== REAL TRIGGERBOT ====================
+bool g_RealTriggerbotEnabled = false;
+int g_RealTriggerbotKey = VK_XBUTTON2;
+int g_RealTriggerbotDelay = 50;
+bool g_RealTriggerbotTeamCheck = true;
+DWORD g_LastRealTriggerbotShot = 0;
+
+// ==================== DEFIB AUTO-REVIVE ====================
+bool g_DefibAutoRevive = false;
+
+// ==================== VOTEKICK AUTO-DODGE (Linux-style) ====================
+bool g_VoteKickDodge = false;
+bool g_DodgeOnPlayerKick = true;
+bool g_VoteKickDodgeFired = false;
+uintptr_t g_LastVoteMsg = 0;
+int32_t g_LastVoteTargetId = -1;
+bool g_ShowRejoinTimer = true;
+DWORD g_DodgeFiredAtTick = 0;
+
+static bool g_DodgeFiredThisVote = false;
+static uintptr_t g_LatchedVoteMsg = 0;
+static int32_t g_LatchedTargetId = -1;
+static volatile bool g_ConsoleBusy = false;
+static DWORD g_ConsoleBlockUntil = 0;
+static bool g_ConsoleWasOpen = false;
+
+// Legacy votekick (keep for UI, but not used for detection)
+bool g_AutoDodgeVotekick = false;
+float g_DodgeDelay = 0.0f;
+bool g_DodgeNotification = true;
+bool g_IgnoreSelfVotes = true;
+bool g_AutoRejoinAfterDodge = false;
+int g_ActiveVotesCount = 0;
+char g_LastVoteTarget[64] = "";
+int g_LastVoteTargetId_legacy = -1;
+int g_LastVoteCallerId = -1;
+DWORD g_LastVotekickCheck = 0;
+bool g_VotekickDetected = false;
+DWORD g_VotekickDetectedTime = 0;
+
+// ==================== CHAT SPAMMER ====================
+bool g_ChatSpammerEnabled = false;
+char g_ChatSpamMessage[256] = "";
+float g_ChatSpamDelay = 2.0f;
+DWORD g_LastChatSpamTime = 0;
+int g_ChatSpamCount = 0;
+bool g_ChatSpamRandomize = true;
+bool g_ChatSpamFunnyMode = true;
+
+const char* g_FunnyMessages[] = {
+    "gaming chair just arrived", "is this game pay to win?", "how do i reload?",
+    "which button is crouch?", "this DLC is OP", "instructions unclear, joined wrong team",
+    "i played blindfolded", "my grandma plays better than you", "i sneezed and got a triple",
+    "accidentally installed skill instead of game", "sorry was watching netflix",
+    "brb house is flooding", "im actually colorblind", "playing on a microwave",
+    "my mom said dinner is ready", "controller disconnected mid fight",
+    "wifi went out for 2 seconds", "playing from mcdonalds wifi", "phone charger caught fire",
+    "accidentally won that", "wasnt even looking at screen", "thought this was tutorial",
+    "wrong game opened oops", "built different fr", "skill issue on your part",
+    "didnt know friendly fire was off", "using my left hand only", "playing with steering wheel",
+    "instructions unclear got MVP", "forgot i was even playing", "alt tabbed and still won",
+    "playing with monitor off", "uninstalled and reinstalled real quick",
+    "lag made me better somehow", "servers lagging not me", "packet loss made me god",
+    "vpn to antarctica activated", "my toaster has better fps", "playing on fridge screen",
+    "connection timeout saved me"
+};
+const int g_FunnyMessagesCount = 40;
+
+// ==================== CLAN TAG ====================
+bool g_ClanTagEnabled = false;
+bool g_ClanTagRandomMode = false;
+char g_ClanTagSingle[32] = "LEGIT";
+char g_ClanTagList[10][32] = { "LEGIT", "PRO", "NOOB", "GG", "EZ", "LOL", "WTF", "OP", "REKT", "MLG" };
+int g_ClanTagCount = 10;
+float g_ClanTagRotateInterval = 5.0f;
+DWORD g_LastClanTagChange = 0;
+int g_CurrentClanTagIndex = 0;
+
+// ==================== SKIN CHANGER ====================
+bool g_SkinChangerEnabled = false;
+int g_SelectedCharacterIndex = -1;
+int g_SelectedSkinID = -1;
+bool g_SkinChangerApplied = false;
+DWORD g_LastSkinChangeTime = 0;
+int g_CharacterInfoOffset = 0xa60;
+
+const char* g_CharacterNames[] = {
+    "Default (No Change)", "Aura", "Arty", "Bushwhacker", "Fletcher", "Fragger",
+    "Kira", "Nader", "Phoenix", "Proxy", "Rhino", "Sawbonez", "Skyhammer",
+    "Sparks", "Stoker", "Thunder", "Vassili"
+};
+const int g_CharacterNamesCount = 17;
+
+const int g_CharacterIndexMap[] = {
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+};
+
+// ==================== TELEPORT EXPLOIT ====================
+bool g_TpEnabled = false;
+int g_TpMode = 0; // 0=Enemy TP, 1=Random, 2=Downed TM, 3=Crosshair, 4=Auto Random (on kill), 5=Auto Random 2 (timed)
+int g_TpKey = VK_RBUTTON;
+float g_TpCooldown = 0.5f;
+DWORD g_LastTpTime = 0;
+uintptr_t g_CurrentTpTarget = 0;
+uintptr_t g_RandomEnemyTarget = 0;
+bool g_TpWasKeyDown = false;
+bool g_EspDownedTeammates = true;
+bool g_TpActive = false;
+FVector g_LastPlayerLocation = {0,0,0};
+DWORD g_LastLocationCheck = 0;
+
+// TP Orientation (no stepped)
+bool g_TpFaceTarget = true;
+float g_TpAimHeightOffset = 40.0f;
+bool g_TpIncludeTeammates = false;
+
+// Auto Random TP mode 4
+bool g_AutoRandomTpEnabled = false;
+uintptr_t g_AutoRandomTpTarget = 0;
+bool g_AutoRandomTpWasAlive = false;
+
+// Auto Random TP mode 5
+bool g_AutoRandomTp2Enabled = false;
+float g_AutoRandomTp2Interval = 2.0f;
+DWORD g_LastAutoRandomTp2 = 0;
+uintptr_t g_AutoRandomTp2Target = 0;
+
+// TP pools
+std::vector<uintptr_t> g_AllEnemies;
+std::vector<uintptr_t> g_AllPawns;
+std::vector<uintptr_t> g_RandomTpPool;
+
+// ==================== SPREAD SCANNER ====================
+int g_SpreadOffset = 0x13D4;
+int g_SpreadObjType = 1;
+struct SpreadCandidate { int offset; float lastValue; float baseline; float firing; int score; bool testing; int objType; };
+std::vector<SpreadCandidate> g_Candidates;
+bool g_IsScanningSpread = false;
+bool g_ScanPawn = true;
+bool g_ScanSubObject = true;
+int g_ScanFrameCount = 0;
+int g_ScanCount = 0;
+struct ManualOffset { int offset; int objType; float lastVal; bool frozen; bool changed; uint32_t lastChangeTime; };
+std::vector<ManualOffset> g_ManualOffsets;
+bool g_HideUnchanged = true;
+
+// ==================== PAWN CACHE ====================
+struct CachedPawn {
+    ImVec2 screenCenter;
+    ImVec2 sBase;
+    ImVec2 sHead;
+    ImVec2 boxMin;
+    ImVec2 boxMax;
+    int hp;
+    int hpMax;
+    int team;
+    bool isEnemy;
+    bool isVisible;
+    bool isDowned;
+    char name[64];
+    uintptr_t pawnPtr;
+};
+std::vector<CachedPawn> g_PawnCache;
+
+struct PawnNameCache {
+    uintptr_t pawnPtr;
+    char name[64];
+    DWORD lastUpdate;
+};
+std::vector<PawnNameCache> g_PawnNames;
+
+int g_NameCacheFrameCounter = 0;
+const int NAME_CACHE_INTERVAL = 60;
+
+int g_ThirdPersonIdx = -1;
+int g_FirstPersonIdx = -1;
+
+// Global view-projection matrix
+Matrix g_ViewProjMatrix;
+Matrix4x4 g_ViewProj4x4;
+bool g_ViewProjValid = false;
+
+// Viewmodel Settings
+float g_VmX = 3.50f;
+float g_VmY = 0.20f;
+float g_VmZ = 0.25f;
+uintptr_t g_LocalPawn = 0;
+uintptr_t g_WorldInfo = 0;
+
+// Hooking
+typedef HRESULT(WINAPI* f_Present)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+f_Present oPresent = NULL;
+WNDPROC oWndProc = NULL;
+IDirect3DDevice9* g_Device = NULL;
+bool g_ImguiInit = false;
+
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// ==================== SAFE MEMORY HELPERS ====================
+bool ValidPtr(uintptr_t ptr, uintptr_t m = 0x1000) { 
+    return (ptr >= m && ptr < 0x00007FFFFFFFFFFF); 
+}
+
+bool IsReadable(uintptr_t addr, size_t size) {
+    if (addr < 0x10000) return false;
+    if (addr + size < addr) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & PAGE_NOACCESS) return false;
+    if (mbi.Protect & PAGE_GUARD) return false;
+    return true;
+}
+
+template<typename T>
+bool SafeRead(uintptr_t addr, T* out) {
+    if (!IsReadable(addr, sizeof(T))) return false;
+    *out = *(T*)addr;
+    return true;
+}
+
+bool SafeWriteFloat(uintptr_t addr, float v) {
+    if (!IsReadable(addr, sizeof(float))) return false;
+    *(float*)addr = v;
+    return true;
+}
+
+bool SafeWriteVector3(uintptr_t addr, float x, float y, float z) {
+    if (!IsReadable(addr, sizeof(float) * 3)) return false;
+    *(float*)(addr + 0x0) = x;
+    *(float*)(addr + 0x4) = y;
+    *(float*)(addr + 0x8) = z;
+    return true;
+}
+
+bool SafeWriteInt(uintptr_t addr, int32_t v) {
+    if (!IsReadable(addr, sizeof(int32_t))) return false;
+    *(int32_t*)addr = v;
+    return true;
+}
+
+bool SafeWriteBool(uintptr_t addr, bool v) {
+    if (!IsReadable(addr, sizeof(bool))) return false;
+    *(bool*)addr = v;
+    return true;
+}
+
+bool SafeReadFVector(uintptr_t addr, FVector* out) {
+    if (!IsReadable(addr, sizeof(FVector))) return false;
+    *out = *(FVector*)addr;
+    return true;
+}
+
+bool WriteTArrayInt32First(uintptr_t arrayBase, int32_t value) {
+    if (!ValidPtr(arrayBase)) return false;
+
+    uintptr_t data  = 0;
+    int32_t   count = 0;
+    int32_t   maxc  = 0;
+
+    if (!SafeRead(arrayBase + 0x0, &data))  return false;
+    if (!SafeRead(arrayBase + 0x8, &count)) return false;
+    if (!SafeRead(arrayBase + 0xC, &maxc))  return false;
+
+    if (!ValidPtr(data))           return false;
+    if (count <= 0 || count > 8)   return false;
+    if (maxc < count || maxc > 32) return false;
+
+    int32_t cur = 0;
+    if (!SafeRead((uintptr_t)data, &cur)) return false;
+    if (cur < 0 || cur > 256)             return false;
+
+    if (!IsReadable((uintptr_t)data, sizeof(int32_t))) return false;
+    *(int32_t*)data = value;
+    return true;
+}
+
+// ==================== TP HELPERS ====================
+
+void TeleportPlayer(uintptr_t pawn, FVector location) {
+    if (!ValidPtr(pawn)) return;
+    if (!IsReadable(pawn + ACTOR_LOCATION, sizeof(FVector))) return;
+    *(FVector*)(pawn + ACTOR_LOCATION) = location;
+}
+
+void FaceTowards(uintptr_t actor, FVector fromPos, FVector targetPos) {
+    if (!ValidPtr(actor)) return;
+
+    float dx = targetPos.x - fromPos.x;
+    float dy = targetPos.y - fromPos.y;
+    float dz = targetPos.z - fromPos.z;
+
+    float horiz = sqrtf(dx*dx + dy*dy);
+    if (horiz < 0.001f) return;
+
+    int32_t yaw   = (int32_t)(atan2f(dy, dx) * RAD_TO_UR);
+    int32_t pitch = (int32_t)(atan2f(dz, horiz) * RAD_TO_UR);
+
+    if (IsReadable(actor + ACTOR_ROTATION, 12)) {
+        *(int32_t*)(actor + ACTOR_ROTATION + 0) = pitch;
+        *(int32_t*)(actor + ACTOR_ROTATION + 4) = yaw;
+        *(int32_t*)(actor + ACTOR_ROTATION + 8) = 0;
+    }
+}
+
+void OrientAtTarget(uintptr_t localPawn, FVector targetLoc) {
+    if (!g_TpFaceTarget) return;
+    if (!ValidPtr(localPawn)) return;
+
+    FVector myLoc;
+    if (!SafeReadFVector(localPawn + ACTOR_LOCATION, &myLoc)) return;
+
+    FVector aim = targetLoc;
+    aim.z += g_TpAimHeightOffset;
+
+    FaceTowards(g_PC, myLoc, aim);
+    FaceTowards(localPawn, myLoc, aim);
+}
+
+void PerformTP(uintptr_t localPawn, FVector target) {
+    // Direct teleport (no stepped TP - as requested)
+    TeleportPlayer(localPawn, target);
+    OrientAtTarget(localPawn, target);
+}
+
+// ==================== PAWN ITERATION ====================
+
+template<typename Fn>
+void ForEachPawn(Fn fn) {
+    uintptr_t world = 0;
+    if (!SafeRead(g_Base + GWORLD_OFFSET, &world) || !ValidPtr(world)) return;
+    uintptr_t level = 0;
+    if (!SafeRead(world + 0x80, &level) || !ValidPtr(level)) return;
+    uintptr_t worldInfoPtr = 0;
+    if (!SafeRead(level + 0x60, &worldInfoPtr) || !ValidPtr(worldInfoPtr)) return;
+    uintptr_t worldInfo = 0;
+    if (!SafeRead(worldInfoPtr, &worldInfo) || !ValidPtr(worldInfo)) return;
+    g_WorldInfo = worldInfo;
+
+    uintptr_t currentPawn = 0;
+    if (!SafeRead(worldInfo + 0x884, &currentPawn)) return;
+
+    int safety = 0;
+    while (ValidPtr(currentPawn) && safety++ < 400) {
+        fn(currentPawn);
+        uintptr_t next = 0;
+        if (!SafeRead(currentPawn + 0x710, &next)) break;
+        currentPawn = next;
+    }
+}
+
+void BuildEnemyLists() {
+    g_AllEnemies.clear();
+    g_AllPawns.clear();
+    g_RandomTpPool.clear();
+    if (!ValidPtr(g_LocalPawn)) return;
+
+    int myTeam = GetPawnTeam(g_LocalPawn);
+    if (myTeam == -1) return;
+
+    ForEachPawn([&](uintptr_t p) {
+        if (p == g_LocalPawn) return;
+        if (!IsPawnAlive(p)) return;
+
+        int t = GetPawnTeam(p);
+        if (t == -1) return;
+
+        bool isTeammate = (t == myTeam);
+        if (IsPawnDowned(p)) return;
+
+        FVector loc;
+        if (!SafeReadFVector(p + ACTOR_LOCATION, &loc)) return;
+        if (loc.x == 0.0f && loc.y == 0.0f && loc.z == 0.0f) return;
+
+        g_AllPawns.push_back(p);
+
+        if (!isTeammate) {
+            g_AllEnemies.push_back(p);
+        }
+
+        if (!isTeammate || g_TpIncludeTeammates) {
+            g_RandomTpPool.push_back(p);
+        }
+    });
+}
+
+// ==================== MELEE HELPERS ====================
+
+static void ApplyMeleeForwardOffset(uintptr_t proxy, uintptr_t collComp, float forwardOffset) {
+    if (!ValidPtr(proxy) || !ValidPtr(collComp)) return;
+
+    uintptr_t attachMesh = 0;
+    if (SafeRead(proxy + IMPACTPROXY_ATTACHMESH, &attachMesh) && ValidPtr(attachMesh)) {
+        uintptr_t attData = 0;
+        int32_t   attCount = 0;
+        if (SafeRead(attachMesh + SKELCOMP_ATTACHMENTS,       &attData)  &&
+            SafeRead(attachMesh + SKELCOMP_ATTACHMENTS + 0x8, &attCount) &&
+            ValidPtr(attData) && attCount > 0 && attCount < 64)
+        {
+            for (int i = 0; i < attCount; i++) {
+                uintptr_t entry = attData + (i * FATTACHMENT_SIZE);
+                uintptr_t entryComp = 0;
+                if (!SafeRead(entry + FATTACHMENT_COMPONENT, &entryComp)) continue;
+                if (entryComp != collComp) continue;
+
+                FVector relLoc;
+                if (SafeReadFVector(entry + FATTACHMENT_RELLOC, &relLoc)) {
+                    relLoc.x = forwardOffset;
+                    SafeWriteVector3(entry + FATTACHMENT_RELLOC,
+                                     relLoc.x, relLoc.y, relLoc.z);
+                }
+                break;
+            }
+        }
+    }
+
+    FVector t = {0, 0, 0};
+    if (SafeReadFVector(collComp + PRIMCOMP_TRANSLATION, &t)) {
+        SafeWriteVector3(collComp + PRIMCOMP_TRANSLATION,
+                         forwardOffset, t.y, t.z);
+    }
+}
+
+// ==================== CONSOLE COMMAND PIPELINE ====================
+
+static void SendKey(WORD vkCode, bool keyDown) {
+    INPUT input = {0};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = vkCode;
+    input.ki.dwFlags = keyDown ? 0 : KEYEVENTF_KEYUP;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+static void ReleaseGameplayKeys() {
+    const WORD keys[] = {
+        'W', 'A', 'S', 'D',
+        VK_SPACE, VK_SHIFT, VK_CONTROL,
+        VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT
+    };
+    for (WORD k : keys) {
+        INPUT in = {0};
+        in.type = INPUT_KEYBOARD;
+        in.ki.wVk = k;
+        in.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(1, &in, sizeof(INPUT));
+    }
+}
+
+static void TypeStringFast(const char* text) {
+    for (int i = 0; text[i] != '\0'; i++) {
+        char c = text[i];
+        SHORT vk = VkKeyScanA(c);
+        BYTE keyCode    = LOBYTE(vk);
+        BYTE shiftState = HIBYTE(vk);
+
+        if (shiftState & 1) { SendKey(VK_SHIFT, true); Sleep(1); }
+        SendKey(keyCode, true);
+        Sleep(1);
+        SendKey(keyCode, false);
+        if (shiftState & 1) { SendKey(VK_SHIFT, false); }
+        Sleep(2);
+    }
+}
+
+struct ConsoleCommandData {
+    char command[350];
+    volatile bool executing;
+};
+static ConsoleCommandData g_PendingCommand = { "", false };
+static HANDLE g_CommandThread = NULL;
+
+static DWORD WINAPI CommandExecutionThread(LPVOID) {
+    g_ConsoleBusy = true;
+
+    ReleaseGameplayKeys();
+    Sleep(30);
+
+    bool needToggle = !g_ConsoleWasOpen;
+    if (needToggle) {
+        SendKey(VK_OEM_3, true);  Sleep(30);  SendKey(VK_OEM_3, false);
+        Sleep(50);
+    }
+
+    TypeStringFast(g_PendingCommand.command);
+    Sleep(20);
+
+    SendKey(VK_RETURN, true); Sleep(10); SendKey(VK_RETURN, false);
+    Sleep(20);
+
+    if (needToggle) {
+        SendKey(VK_OEM_3, true);  Sleep(30); SendKey(VK_OEM_3, false);
+    }
+
+    g_ConsoleBusy = false;
+    g_PendingCommand.executing = false;
+    return 0;
+}
+
+static void ExecuteConsoleCommand(const char* command) {
+    if (g_PendingCommand.executing) return;
+
+    strncpy_s(g_PendingCommand.command, command, _TRUNCATE);
+    g_PendingCommand.executing = true;
+
+    if (g_CommandThread) { CloseHandle(g_CommandThread); g_CommandThread = NULL; }
+    g_CommandThread = CreateThread(NULL, 0, CommandExecutionThread, NULL, 0, NULL);
+}
+
+static bool IsConsoleBlockingInput() {
+    if (g_ConsoleBusy) return true;
+    if (g_ConsoleBlockUntil != 0 && GetTickCount() < g_ConsoleBlockUntil) return true;
+    return false;
+}
+
+// ==================== VOTE-KICK DODGE (Linux-style) ====================
+
+void ResetVoteKickLatch() {
+    g_DodgeFiredThisVote = false;
+    g_LatchedVoteMsg     = 0;
+    g_LatchedTargetId    = -1;
+    g_LastVoteMsg        = 0;
+    g_LastVoteTargetId   = -1;
+    g_ConsoleBusy        = false;
+}
+
+void CheckVoteKickDodge() {
+    if (!g_VoteKickDodge) {
+        ResetVoteKickLatch();
+        return;
+    }
+    if (!ValidPtr(g_PC)) return;
+
+    uintptr_t voteMsg = 0;
+    if (!SafeRead(g_PC + PC_ACTIVE_VOTE, &voteMsg) || !ValidPtr(voteMsg)) {
+        ResetVoteKickLatch();
+        return;
+    }
+
+    bool systemCalled = false;
+    SafeRead(voteMsg + VOTE_M_BSYSTEMCALLED, &systemCalled);
+    if (!g_DodgeOnPlayerKick && !systemCalled) return;
+
+    int32_t targetId = 0;
+    if (!SafeRead(voteMsg + VOTE_M_TARGETTOKICKID, &targetId)) return;
+    if (targetId <= 0 || targetId > 0xFFFFFF) return;
+
+    uintptr_t pri = 0;
+    if (!SafeRead(g_PC + PC_M_SGPRI, &pri) || !ValidPtr(pri)) return;
+
+    int32_t myId = 0;
+    if (!SafeRead(pri + PRI_PLAYER_ID, &myId)) return;
+    if (myId <= 0) return;
+
+    g_LastVoteMsg        = voteMsg;
+    g_LastVoteTargetId   = targetId;
+
+    if (targetId != myId) return;
+
+    bool sameVote = (voteMsg   == g_LatchedVoteMsg) &&
+                    (targetId  == g_LatchedTargetId);
+
+    if (sameVote && g_DodgeFiredThisVote) return;
+
+    g_LatchedVoteMsg     = voteMsg;
+    g_LatchedTargetId    = targetId;
+    g_DodgeFiredThisVote = false;
+
+    SafeWriteBool(g_PC + PC_DEVELOPER_CONSOLE_ENABLED, true);
+    Sleep(16);
+
+    g_ConsoleBlockUntil = GetTickCount() + VOTEKICK_TIMER_MS;
+    ExecuteConsoleCommand("disconnect");
+
+    g_DodgeFiredThisVote = true;
+    g_VoteKickDodgeFired = true;
+    g_DodgeFiredAtTick   = GetTickCount();
+}
+
+// ==================== TP TARGET HELPERS ====================
+
+uintptr_t GetClosestEnemyInFOV(FVector myLoc, FRotator myRot) {
+    if (g_AllEnemies.empty()) return 0;
+    uintptr_t closest = 0;
+    float closestDist = 999999.0f;
+    float aimFov = g_FovCircleRadius * 0.075f;
+
+    for (uintptr_t p : g_AllEnemies) {
+        if (!ValidPtr(p)) continue;
+        FVector targetLoc = {0,0,0};
+        if (!SafeReadFVector(p + ACTOR_LOCATION, &targetLoc)) continue;
+
+        float dx = targetLoc.x - myLoc.x;
+        float dy = targetLoc.y - myLoc.y;
+        float dz = targetLoc.z - myLoc.z;
+
+        float yawReq = atan2f(dy, dx) * 57.2957f;
+        float pitchReq = atan2f(dz, sqrtf(dx*dx + dy*dy)) * 57.2957f;
+        float mY = (float)myRot.yaw / (UR_UNITS / 57.2957f);
+        float mP = (float)myRot.pitch / (UR_UNITS / 57.2957f);
+        float dY = fabsf(yawReq - mY); if (dY > 180.0f) dY = fabsf(360.0f - dY);
+        float dP = fabsf(pitchReq - mP);
+
+        if (dY < aimFov && dP < aimFov) {
+            float d = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (d < closestDist) { closestDist = d; closest = p; }
+        }
+    }
+    return closest;
+}
+
+uintptr_t GetRandomTarget() {
+    if (ValidPtr(g_RandomEnemyTarget)) {
+        for (uintptr_t p : g_RandomTpPool) {
+            if (p == g_RandomEnemyTarget) return g_RandomEnemyTarget;
+        }
+        g_RandomEnemyTarget = 0;
+    }
+
+    if (g_RandomTpPool.empty()) return 0;
+
+    g_RandomEnemyTarget = g_RandomTpPool[rand() % g_RandomTpPool.size()];
+    return g_RandomEnemyTarget;
+}
+
+uintptr_t GetRandomTargetExcluding(uintptr_t exclude, uintptr_t* outSlot) {
+    if (g_RandomTpPool.empty()) return 0;
+
+    if (g_RandomTpPool.size() == 1) {
+        if (outSlot) *outSlot = g_RandomTpPool[0];
+        return g_RandomTpPool[0];
+    }
+
+    for (int i = 0; i < 8; i++) {
+        uintptr_t pick = g_RandomTpPool[rand() % g_RandomTpPool.size()];
+        if (pick != exclude) {
+            if (outSlot) *outSlot = pick;
+            return pick;
+        }
+    }
+    for (uintptr_t p : g_RandomTpPool) {
+        if (p != exclude) {
+            if (outSlot) *outSlot = p;
+            return p;
+        }
+    }
+    return 0;
+}
+
+uintptr_t GetRandomDownedTeammate(int myTeam) {
+    std::vector<uintptr_t> downed;
+    ForEachPawn([&](uintptr_t p) {
+        if (p == g_LocalPawn) return;
+        if (IsPawnDowned(p)) {
+            int t = GetPawnTeam(p);
+            if (t == myTeam && t != -1) downed.push_back(p);
+        }
+    });
+    if (downed.empty()) return 0;
+    return downed[rand() % downed.size()];
+}
+
+bool GetCrosshairTraceData(uintptr_t pc, FVector& outHit, uintptr_t& outActor) {
+    if (!ValidPtr(pc)) return false;
+    uintptr_t tracePtr = pc + 0x1828;
+    bool valid = false;
+    if (!SafeRead(tracePtr + 0x0, &valid) || !valid) return false;
+    SafeRead(tracePtr + 0x4, &outActor);
+    SafeReadFVector(tracePtr + 0x28, &outHit);
+    return true;
+}
+
+bool GetPlayerViewPoint(FVector& outLoc, FRotator& outRot) {
+    if (!ValidPtr(g_PC)) return false;
+    uintptr_t vtable = 0;
+    if (!SafeRead(g_PC, &vtable) || !ValidPtr(vtable)) return false;
+    uintptr_t func = 0;
+    if (!SafeRead(vtable + 0x9E0, &func) || !ValidPtr(func)) return false;
+    typedef void(__fastcall* tGetVP)(uintptr_t, FVector*, FRotator*);
+    ((tGetVP)func)(g_PC, &outLoc, &outRot);
+    return true;
+}
+
+uintptr_t ResolveSGCamera() {
+    if (!ValidPtr(g_PC)) return 0;
+    uintptr_t sgPawn = 0, viewTarget = 0, cam = 0;
+    if (!SafeRead(g_PC + 0x17a8, &sgPawn) || !ValidPtr(sgPawn)) return 0;
+    if (!SafeRead(sgPawn + 0x1df8, &viewTarget) || !ValidPtr(viewTarget)) return 0;
+    if (!SafeRead(viewTarget + 0x18e4, &cam) || !ValidPtr(cam)) return 0;
+    return cam;
+}
+
+// ==================== OTHER HELPERS ====================
+
+void ReadFString(uintptr_t stringAddr, char* buffer, int maxLen) {
+    buffer[0] = '\0';
+    if (!ValidPtr(stringAddr) || maxLen <= 0) return;
+    __try {
+        wchar_t* data = *(wchar_t**)stringAddr;
+        int count = *(int*)(stringAddr + 8);
+        int max = *(int*)(stringAddr + 12);
+        
+        if (!ValidPtr((uintptr_t)data)) return;
+        if (count <= 0 || count > 256) return;
+        if (max <= 0 || max > 512) return;
+        if (count > max) return;
+        
+        int len = (count < maxLen - 1) ? count : maxLen - 1;
+        for (int i = 0; i < len; i++) {
+            wchar_t wc = data[i];
+            if (wc == 0) break;
+            buffer[i] = (wc > 0 && wc < 128) ? (char)wc : '?';
+        }
+        buffer[len] = '\0';
+    } __except(1) { 
+        buffer[0] = '\0'; 
+    }
+}
+
+void GenerateRandomString(char* buffer, int length) {
+    const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const int charsetSize = sizeof(charset) - 1;
+    
+    for (int i = 0; i < length; i++) {
+        buffer[i] = charset[rand() % charsetSize];
+    }
+    buffer[length] = '\0';
+}
+
+// ==================== CONFIG SYSTEM ====================
+
+void SaveConfig() {
+    char path[MAX_PATH]; GetModuleFileNameA(NULL, path, MAX_PATH);
+    char* last = strrchr(path, '\\'); if (last) *(last + 1) = '\0';
+    strcat_s(path, X("legit_config.ini"));
+    auto W = [&](const char* k, float v) { char b[32]; sprintf_s(b, "%.2f", v); WritePrivateProfileStringA(X("Aim"), k, b, path); };
+    auto WI = [&](const char* k, int v) { char b[32]; sprintf_s(b, "%d", v); WritePrivateProfileStringA(X("Aim"), k, b, path); };
+    
+    WI(X("Enabled"), g_AimbotEnabled); 
+    WI(X("SilentAim"), g_SilentAim);
+    WI(X("SilentCD"), g_SilentAimCooldown);
+    WI(X("BoneTarget"), g_AimTargetBone);
+    W(X("Smooth"), g_Smoothing); WI(X("Type"), g_SmoothType);
+    W(X("Z"), g_ZOffset); W(X("Jitter"), g_AimJitter);
+    WI(X("FovE"), g_FovCircleEnabled); W(X("FovR"), g_FovCircleRadius);
+    WI(X("TeamCheck"), g_TeamCheck);
+    WI(X("Key"), g_AimKey);
+    WI(X("NoRecoil"), g_NoRecoil);
+    WI(X("NoSpread"), g_NoSpread);
+    W(X("CustomSpread"), g_CustomSpreadValue);
+    WI(X("EspBox"), g_EspBox);
+    WI(X("EspHealth"), g_EspHealth);
+    WI(X("EspNames"), g_EspNames);
+    WI(X("EspTeam"), g_EspTeammates);
+    WI(X("EspTracers"), g_EspTracers);
+    WI(X("EspDowned"), g_EspDownedTeammates);
+    W(X("VmX"), g_VmX); W(X("VmY"), g_VmY); W(X("VmZ"), g_VmZ);
+    
+    // TP
+    WI(X("TpEnabled"), g_TpEnabled);
+    WI(X("TpMode"), g_TpMode);
+    WI(X("TpKey"), g_TpKey);
+    W(X("TpCooldown"), g_TpCooldown);
+    WI(X("TpFaceTarget"), g_TpFaceTarget);
+    W(X("TpAimHeight"), g_TpAimHeightOffset);
+    WI(X("TpIncludeTeammates"), g_TpIncludeTeammates);
+    WI(X("AutoRandomTpEnabled"), g_AutoRandomTpEnabled);
+    WI(X("AutoRandomTp2Enabled"), g_AutoRandomTp2Enabled);
+    W(X("AutoRandomTp2Interval"), g_AutoRandomTp2Interval);
+    WI(X("BoneToggleKey"), g_BoneToggleKey);
+    W(X("TpDist"), g_ThirdPersonDistance);
+    
+    // One Hit Kill
+    WI(X("ProjectilesPerShot"), g_ProjectilesPerShotEnabled);
+    WI(X("ProjectilesPerShotValue"), g_ProjectilesPerShotValue);
+    
+    // Melee
+    WI(X("MeleeRange"), g_MeleeRange);
+    W(X("MeleeBoundsScale"), g_MeleeBoundsScale);
+    WI(X("MeleeVisualScale"), g_MeleeVisualScale);
+    WI(X("MeleeWideAngle"), g_MeleeWideAngle);
+    W(X("MeleeHitDot"), g_MeleeHitDot);
+    WI(X("MeleePushForward"), g_MeleePushForward);
+    W(X("MeleeForwardOffset"), g_MeleeForwardOffset);
+    WI(X("FastMelee"), g_FastMelee);
+    W(X("MeleeFireInterval"), g_MeleeFireInterval);
+    WI(X("FastMeleeForceNextFire"), g_FastMeleeForceNextFire);
+    
+    // Rapid Fire
+    WI(X("RapidFire"), g_RapidFire);
+    W(X("FireRate"), g_FireRate);
+    WI(X("InfiniteAmmo"), g_InfiniteAmmo);
+    
+    // Defib
+    WI(X("InstantDefibCharge"), g_InstantDefibCharge);
+    WI(X("MaxDefibDamage"), g_MaxDefibDamage);
+    W(X("DefibRangeMultiplier"), g_DefibRangeMultiplier);
+    
+    // Auto Shoot
+    WI(X("AutoShoot"), g_AutoShootEnabled);
+    WI(X("AutoShootKey"), g_AutoShootKey);
+    WI(X("AutoShootDly"), g_AutoShootDelay);
+    WI(X("AutoShootTm"), g_AutoShootTeamCheck);
+    WI(X("AutoShootToggle"), g_AutoShootToggleMode);
+    
+    // Real Triggerbot
+    WI(X("RealTrigger"), g_RealTriggerbotEnabled);
+    WI(X("RealTrigKey"), g_RealTriggerbotKey);
+    WI(X("RealTrigDly"), g_RealTriggerbotDelay);
+    WI(X("RealTrigTm"), g_RealTriggerbotTeamCheck);
+    
+    // Defib Auto-Revive
+    WI(X("DefibRevive"), g_DefibAutoRevive);
+    
+    // Vote-Kick Dodge
+    WI(X("VoteKickDodge"), g_VoteKickDodge);
+    WI(X("DodgeOnPlayerKick"), g_DodgeOnPlayerKick);
+    WI(X("ShowRejoinTimer"), g_ShowRejoinTimer);
+    // Legacy
+    WI(X("VKDodge"), g_AutoDodgeVotekick);
+    W(X("VKDelay"), g_DodgeDelay);
+    WI(X("VKNotif"), g_DodgeNotification);
+    WI(X("VKIgnoreSelf"), g_IgnoreSelfVotes);
+    WI(X("VKRejoin"), g_AutoRejoinAfterDodge);
+    
+    // Chat Spammer
+    WI(X("ChatSpam"), g_ChatSpammerEnabled);
+    W(X("ChatDelay"), g_ChatSpamDelay);
+    WI(X("ChatRand"), g_ChatSpamRandomize);
+    WI(X("ChatFunny"), g_ChatSpamFunnyMode);
+    WritePrivateProfileStringA(X("Aim"), X("ChatMsg"), g_ChatSpamMessage, path);
+    
+    // Clan Tag
+    WI(X("ClanTag"), g_ClanTagEnabled);
+    WI(X("ClanRand"), g_ClanTagRandomMode);
+    W(X("ClanInterval"), g_ClanTagRotateInterval);
+    WI(X("ClanCount"), g_ClanTagCount);
+    WritePrivateProfileStringA(X("Aim"), X("ClanSingle"), g_ClanTagSingle, path);
+    for (int i = 0; i < 10; i++) {
+        char key[32];
+        sprintf_s(key, "ClanTag%d", i);
+        WritePrivateProfileStringA(X("Aim"), key, g_ClanTagList[i], path);
+    }
+    
+    // Skin Changer
+    WI(X("SkinEnabled"), g_SkinChangerEnabled);
+    WI(X("CharIndex"), g_SelectedCharacterIndex);
+    WI(X("SkinID"), g_SelectedSkinID);
+}
+
+void LoadConfig() {
+    char path[MAX_PATH]; GetModuleFileNameA(NULL, path, MAX_PATH);
+    char* last = strrchr(path, '\\'); if (last) *(last + 1) = '\0';
+    strcat_s(path, X("legit_config.ini"));
+    auto R = [&](const char* k, float d) { char b[32]; GetPrivateProfileStringA(X("Aim"), k, "", b, 32, path); return b[0] ? (float)atof(b) : d; };
+    auto RI = [&](const char* k, int d) { return (int)GetPrivateProfileIntA(X("Aim"), k, d, path); };
+    
+    g_AimbotEnabled = RI(X("Enabled"), 1); 
+    g_SilentAim = RI(X("SilentAim"), 0);
+    g_SilentAimCooldown = RI(X("SilentCD"), 50);
+    g_AimTargetBone = RI(X("BoneTarget"), 1);
+    g_Smoothing = R(X("Smooth"), 15.0f); g_SmoothType = RI(X("Type"), 1);
+    g_ZOffset = R(X("Z"), 0.0f); g_AimJitter = R(X("Jitter"), 0.5f);
+    g_FovCircleEnabled = RI(X("FovE"), 1); g_FovCircleRadius = R(X("FovR"), 150.0f);
+    g_TeamCheck = RI(X("TeamCheck"), 1);
+    g_AimKey = RI(X("Key"), VK_LBUTTON);
+    g_NoRecoil = RI(X("NoRecoil"), 1);
+    g_NoSpread = RI(X("NoSpread"), 1);
+    g_CustomSpreadValue = R(X("CustomSpread"), 0.0f);
+    g_EspBox = RI(X("EspBox"), 1);
+    g_EspHealth = RI(X("EspHealth"), 1);
+    g_EspNames = RI(X("EspNames"), 1);
+    g_EspTeammates = RI(X("EspTeam"), 1);
+    g_EspTracers = RI(X("EspTracers"), 1);
+    g_EspDownedTeammates = RI(X("EspDowned"), 1);
+    g_VmX = R(X("VmX"), 3.50f); g_VmY = R(X("VmY"), 0.20f); g_VmZ = R(X("VmZ"), 0.25f);
+    
+    g_TpEnabled = RI(X("TpEnabled"), 0);
+    g_TpMode = RI(X("TpMode"), 0);
+    g_TpKey = RI(X("TpKey"), VK_RBUTTON);
+    g_TpCooldown = R(X("TpCooldown"), 0.5f);
+    g_TpFaceTarget = RI(X("TpFaceTarget"), 1);
+    g_TpAimHeightOffset = R(X("TpAimHeight"), 40.0f);
+    g_TpIncludeTeammates = RI(X("TpIncludeTeammates"), 0);
+    g_AutoRandomTpEnabled = RI(X("AutoRandomTpEnabled"), 0);
+    g_AutoRandomTp2Enabled = RI(X("AutoRandomTp2Enabled"), 0);
+    g_AutoRandomTp2Interval = R(X("AutoRandomTp2Interval"), 2.0f);
+    g_BoneToggleKey = RI(X("BoneToggleKey"), VK_F2);
+    g_ThirdPersonDistance = R(X("TpDist"), 150.0f);
+    
+    g_ProjectilesPerShotEnabled = RI(X("ProjectilesPerShot"), 0);
+    g_ProjectilesPerShotValue = RI(X("ProjectilesPerShotValue"), 99);
+    
+    g_MeleeRange = RI(X("MeleeRange"), 0);
+    g_MeleeBoundsScale = R(X("MeleeBoundsScale"), 2.3f);
+    g_MeleeVisualScale = RI(X("MeleeVisualScale"), 0);
+    g_MeleeWideAngle = RI(X("MeleeWideAngle"), 0);
+    g_MeleeHitDot = R(X("MeleeHitDot"), -1.0f);
+    g_MeleePushForward = RI(X("MeleePushForward"), 1);
+    g_MeleeForwardOffset = R(X("MeleeForwardOffset"), 2.3f);
+    g_FastMelee = RI(X("FastMelee"), 0);
+    g_MeleeFireInterval = R(X("MeleeFireInterval"), 0.05f);
+    g_FastMeleeForceNextFire = RI(X("FastMeleeForceNextFire"), 1);
+    
+    g_RapidFire = RI(X("RapidFire"), 0);
+    g_FireRate = R(X("FireRate"), 0.05f);
+    g_InfiniteAmmo = RI(X("InfiniteAmmo"), 0);
+    
+    g_InstantDefibCharge = RI(X("InstantDefibCharge"), 0);
+    g_MaxDefibDamage = RI(X("MaxDefibDamage"), 0);
+    g_DefibRangeMultiplier = R(X("DefibRangeMultiplier"), 1.0f);
+    
+    g_AutoShootEnabled = RI(X("AutoShoot"), 0);
+    g_AutoShootKey = RI(X("AutoShootKey"), VK_XBUTTON1);
+    g_AutoShootDelay = RI(X("AutoShootDly"), 50);
+    g_AutoShootTeamCheck = RI(X("AutoShootTm"), 1);
+    g_AutoShootToggleMode = RI(X("AutoShootToggle"), 0);
+    
+    g_RealTriggerbotEnabled = RI(X("RealTrigger"), 0);
+    g_RealTriggerbotKey = RI(X("RealTrigKey"), VK_XBUTTON2);
+    g_RealTriggerbotDelay = RI(X("RealTrigDly"), 50);
+    g_RealTriggerbotTeamCheck = RI(X("RealTrigTm"), 1);
+    
+    g_DefibAutoRevive = RI(X("DefibRevive"), 0);
+    
+    g_VoteKickDodge = RI(X("VoteKickDodge"), 0);
+    g_DodgeOnPlayerKick = RI(X("DodgeOnPlayerKick"), 1);
+    g_ShowRejoinTimer = RI(X("ShowRejoinTimer"), 1);
+    g_AutoDodgeVotekick = RI(X("VKDodge"), 0);
+    g_DodgeDelay = R(X("VKDelay"), 0.0f);
+    g_DodgeNotification = RI(X("VKNotif"), 1);
+    g_IgnoreSelfVotes = RI(X("VKIgnoreSelf"), 1);
+    g_AutoRejoinAfterDodge = RI(X("VKRejoin"), 0);
+    
+    g_ChatSpammerEnabled = RI(X("ChatSpam"), 0);
+    g_ChatSpamDelay = R(X("ChatDelay"), 2.0f);
+    g_ChatSpamRandomize = RI(X("ChatRand"), 1);
+    g_ChatSpamFunnyMode = RI(X("ChatFunny"), 1);
+    GetPrivateProfileStringA(X("Aim"), X("ChatMsg"), "", g_ChatSpamMessage, 256, path);
+    
+    g_ClanTagEnabled = RI(X("ClanTag"), 0);
+    g_ClanTagRandomMode = RI(X("ClanRand"), 0);
+    g_ClanTagRotateInterval = R(X("ClanInterval"), 5.0f);
+    g_ClanTagCount = RI(X("ClanCount"), 10);
+    GetPrivateProfileStringA(X("Aim"), X("ClanSingle"), "LEGIT", g_ClanTagSingle, 32, path);
+    for (int i = 0; i < 10; i++) {
+        char key[32];
+        sprintf_s(key, "ClanTag%d", i);
+        GetPrivateProfileStringA(X("Aim"), key, "", g_ClanTagList[i], 32, path);
+    }
+    
+    g_SkinChangerEnabled = RI(X("SkinEnabled"), 0);
+    g_SelectedCharacterIndex = RI(X("CharIndex"), -1);
+    g_SelectedSkinID = RI(X("SkinID"), -1);
+}
+
+void ResetConfig() {
+    g_AimbotEnabled = true; g_Smoothing = 15.0f; g_SmoothType = 1; g_ZOffset = 0.0f; g_AimJitter = 0.5f;
+    g_FovCircleEnabled = true; g_FovCircleRadius = 150.0f; g_TeamCheck = true; g_AimKey = VK_LBUTTON; 
+    g_NoRecoil = true; g_NoSpread = true; g_CustomSpreadValue = 0.0f;
+    g_VmX = 3.50f; g_VmY = 0.20f; g_VmZ = 0.25f;
+    g_TpEnabled = false; g_TpMode = 0; g_TpKey = VK_RBUTTON; g_TpCooldown = 0.5f;
+    g_MeleeRange = false; g_MeleeBoundsScale = 2.3f; g_FastMelee = false; g_MeleeFireInterval = 0.05f;
+    g_ProjectilesPerShotEnabled = false; g_ProjectilesPerShotValue = 99;
+    g_VoteKickDodge = false; g_DodgeOnPlayerKick = true;
+    SaveConfig();
+}
+
+// ==================== SKIN CHANGER ====================
+
+void ApplySkinChanger() {
+    __try {
+        if (!g_SkinChangerEnabled) {
+            g_SkinChangerApplied = false;
+            return;
+        }
+        
+        if (!ValidPtr(g_LocalPawn)) return;
+        
+        uintptr_t pri = *(uintptr_t*)(g_LocalPawn + 0x3F0);
+        if (!ValidPtr(pri)) {
+            g_SkinChangerApplied = false;
+            return;
+        }
+        
+        if (g_SelectedSkinID >= 0) {
+            __try {
+                *(int32_t*)(pri + 0x740) = g_SelectedSkinID;
+                g_SkinChangerApplied = true;
+                g_LastSkinChangeTime = API.GetTickCount();
+            } __except(1) {}
+        }
+        
+        if (g_SelectedCharacterIndex >= 0 && g_SelectedCharacterIndex < g_CharacterNamesCount) {
+            int targetIndex = g_CharacterIndexMap[g_SelectedCharacterIndex];
+            if (targetIndex >= 0) {
+                __try {
+                    uintptr_t charInfoStruct = pri + 0xc24;
+                    *(int32_t*)(charInfoStruct + 0x0) = targetIndex;
+                    *(int32_t*)(charInfoStruct + 0x4) = targetIndex;
+                    *(int32_t*)(charInfoStruct + 0x8) = targetIndex;
+                    g_SkinChangerApplied = true;
+                    g_LastSkinChangeTime = API.GetTickCount();
+                } __except(1) {}
+            }
+        }
+    } __except(1) {
+        g_SkinChangerApplied = false;
+    }
+}
+
+void ResetSkinChanger() {
+    __try {
+        if (!ValidPtr(g_LocalPawn)) return;
+        uintptr_t charInfo = *(uintptr_t*)(g_LocalPawn + g_CharacterInfoOffset);
+        if (!ValidPtr(charInfo)) return;
+        g_SkinChangerApplied = false;
+    } __except(1) {}
+}
+
+// ==================== GET NAME / FUNCTION NAME ====================
+
+char* GetName(int index) {
+    if (index < 0 || !g_Base) return (char*)"None";
+    uintptr_t data = *(uintptr_t*)(g_Base + 0x22072E8);
+    int count = *(int*)(g_Base + 0x22072F0);
+    if (index >= count || !ValidPtr(data)) return (char*)"None";
+    __try {
+        uintptr_t entry = *(uintptr_t*)(data + (index * 8));
+        if (!ValidPtr(entry)) return (char*)"None";
+        return (char*)(entry + 20);
+    } __except(1) { return (char*)"None"; }
+}
+
+char* GetFunctionName(uintptr_t function) {
+    if (!ValidPtr(function)) return (char*)"";
+    __try {
+        int nameIndex = *(int*)(function + 0x48);
+        return GetName(nameIndex);
+    } __except(1) { return (char*)""; }
+}
+
+// ==================== PROCESS EVENT HOOK ====================
+
+void __fastcall hkProcessEvent(uintptr_t pObject, void* edx, uintptr_t pFunction, void* pParams, void* pResult) {
+    // Vote detection is now handled in CheckVoteKickDodge() using memory offsets (Linux style)
+    // ProcessEvent hook is kept for future use but not used for votekick detection
+    
+    __try {
+        // Could add other function hooks here if needed
+    } __except(1) {}
+    
+    oProcessEvent(pObject, edx, pFunction, pParams, pResult);
+}
+
+// ==================== BONE / DYNAMIC AIM ====================
+
+FVector GetBoneLocation(uintptr_t pawn, int boneIdx) {
+    __try {
+        uintptr_t mesh = *(uintptr_t*)(pawn + 0x440); 
+        if (!ValidPtr(mesh)) return {0,0,0};
+        uintptr_t spaceBases = *(uintptr_t*)(mesh + 0x2FC);
+        if (!ValidPtr(spaceBases)) return {0,0,0};
+        FBoneAtom bone = *(FBoneAtom*)(spaceBases + (boneIdx * 32));
+        FBoneAtom ctw = *(FBoneAtom*)(mesh + 0x720); 
+        FVector localPos = { bone.tx, bone.ty, bone.tz };
+        FVector world = RotateVector(localPos, ctw.x, ctw.y, ctw.z, ctw.w);
+        return {
+            (world.x * ctw.scale) + ctw.tx,
+            (world.y * ctw.scale) + ctw.ty,
+            (world.z * ctw.scale) + ctw.tz
+        };
+    } __except(1) { return {0,0,0}; }
+}
+
+FVector GetDynamicAimPoint(uintptr_t pawn, int targetBone) {
+    __try {
+        FVector loc = *(FVector*)(pawn + 0x330);
+        
+        switch(targetBone) {
+            case 0: {
+                FVector headBone = GetBoneLocation(pawn, 0);
+                if (headBone.x != 0 || headBone.y != 0) return headBone;
+                float eyeH = *(float*)(pawn + 0x800);
+                if (eyeH < 5.0f || eyeH > 100.0f) {
+                    float baseE = *(float*)(pawn + 0x7FC);
+                    eyeH = (baseE > 5.0f && baseE < 100.0f) ? baseE : 64.0f;
+                }
+                return { loc.x, loc.y, loc.z + eyeH };
+            }
+            case 1: {
+                FVector chestBone = GetBoneLocation(pawn, 3);
+                if (chestBone.x != 0 || chestBone.y != 0) return chestBone;
+                float eyeH = *(float*)(pawn + 0x800);
+                if (eyeH < 5.0f || eyeH > 100.0f) {
+                    float baseE = *(float*)(pawn + 0x7FC);
+                    eyeH = (baseE > 5.0f && baseE < 100.0f) ? baseE : 64.0f;
+                }
+                return { loc.x, loc.y, loc.z + (eyeH * 0.5f) };
+            }
+            case 2:
+                return loc;
+            case 3:
+            default: {
+                float eyeH = *(float*)(pawn + 0x800);
+                if (eyeH < 5.0f || eyeH > 100.0f) {
+                    float baseE = *(float*)(pawn + 0x7FC);
+                    eyeH = (baseE > 5.0f && baseE < 100.0f) ? baseE : 64.0f;
+                }
+                return { loc.x, loc.y, loc.z + eyeH + g_ZOffset };
+            }
+        }
+    } __except(1) { 
+        return {0,0,0}; 
+    }
+}
+
+// ==================== THIRD PERSON ====================
+
+void SetThirdPerson(bool enable) {
+    if (!ValidPtr(g_PC)) return;
+    uintptr_t cameraContext = *(uintptr_t*)(g_PC + 0xB80);
+    if (!ValidPtr(cameraContext)) return;
+    uintptr_t stylePtr = cameraContext + 0x538;
+    
+    if (g_ThirdPersonIdx == -1 || g_FirstPersonIdx == -1) {
+        int count = *(int*)(g_Base + 0x22072F0);
+        char* tp = X("ThirdPerson");
+        char* fp = X("FirstPerson");
+        for (int i = 0; i < count; i++) {
+            char* name = GetName(i);
+            if (g_ThirdPersonIdx == -1 && _stricmp(name, tp) == 0) g_ThirdPersonIdx = i;
+            if (g_FirstPersonIdx == -1 && _stricmp(name, fp) == 0) g_FirstPersonIdx = i;
+            if (g_ThirdPersonIdx != -1 && g_FirstPersonIdx != -1) break;
+        }
+    }
+    if (enable && g_ThirdPersonIdx != -1) {
+        *(int*)stylePtr = g_ThirdPersonIdx;
+        
+        __try {
+            if (ValidPtr(g_PC)) {
+                uintptr_t m_SGPawn = *(uintptr_t*)(g_PC + 0x17a8);
+                if (ValidPtr(m_SGPawn)) {
+                    uintptr_t m_ViewTarget = *(uintptr_t*)(m_SGPawn + 0x1df8);
+                    if (ValidPtr(m_ViewTarget)) {
+                        uintptr_t sgCamera = *(uintptr_t*)(m_ViewTarget + 0x18e4);
+                        if (ValidPtr(sgCamera)) {
+                            if (g_ThirdPersonDistance >= 50.0f && g_ThirdPersonDistance <= 500.0f) {
+                                *(float*)(sgCamera + ASGCAMERA_THIRDPERSON_DISTANCE) = g_ThirdPersonDistance;
+                            }
+                        }
+                    }
+                }
+            }
+        } __except(1) {}
+    }
+    else if (!enable && g_FirstPersonIdx != -1) *(int*)stylePtr = g_FirstPersonIdx;
+}
+
+// ==================== VIEW PROJ / W2S ====================
+
+static void MatrixMultiply(const Matrix4x4& a, const Matrix4x4& b, Matrix4x4& out) {
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            out.M[i][j] = a.M[i][0]*b.M[0][j] + a.M[i][1]*b.M[1][j] +
+                          a.M[i][2]*b.M[2][j] + a.M[i][3]*b.M[3][j];
+        }
+    }
+}
+
+void BuildViewProj() {
+    g_ViewProjValid = false;
+    if (!ValidPtr(g_PC)) return;
+
+    uintptr_t m_SGPawn = 0, m_ViewTarget = 0, m_SGCamera = 0;
+    if (!SafeRead(g_PC + 0x17a8, &m_SGPawn) || !ValidPtr(m_SGPawn)) return;
+    if (!SafeRead(m_SGPawn + 0x1df8, &m_ViewTarget) || !ValidPtr(m_ViewTarget)) return;
+    if (!SafeRead(m_ViewTarget + 0x18e4, &m_SGCamera) || !ValidPtr(m_SGCamera)) return;
+
+    FVector pos;
+    int32_t int_pitch = 0, int_yaw = 0, int_roll = 0;
+    float fov = 0.0f;
+    if (!SafeReadFVector(m_SGCamera + ACAMERA_POV_LOCATION, &pos)) return;
+    SafeRead(m_SGCamera + ACAMERA_POV_ROTATION_PITCH, &int_pitch);
+    SafeRead(m_SGCamera + ACAMERA_POV_ROTATION_YAW,   &int_yaw);
+    SafeRead(m_SGCamera + ACAMERA_POV_ROTATION_ROLL,  &int_roll);
+    SafeRead(m_SGCamera + ACAMERA_POV_FOV,            &fov);
+
+    if (fov < 1.0f || fov > 170.0f) fov = 90.0f;
+
+    float pitch = URotToDeg(int_pitch) * 3.14159265f / 180.0f;
+    float yaw   = URotToDeg(int_yaw)   * 3.14159265f / 180.0f;
+    float roll  = URotToDeg(int_roll)  * 3.14159265f / 180.0f;
+
+    float cp = cosf(pitch), sp = sinf(pitch);
+    float cy = cosf(yaw),   sy = sinf(yaw);
+    float cr = cosf(roll),  sr = sinf(roll);
+
+    FVector fwd = { cp * cy, cp * sy, sp };
+
+    FVector worldUp = { 0, 0, 1 };
+    FVector right = { worldUp.y*fwd.z - worldUp.z*fwd.y,
+                      worldUp.z*fwd.x - worldUp.x*fwd.z,
+                      worldUp.x*fwd.y - worldUp.y*fwd.x };
+    float rlen = sqrtf(right.x*right.x + right.y*right.y + right.z*right.z);
+    if (rlen < 0.0001f) return;
+    right.x /= rlen; right.y /= rlen; right.z /= rlen;
+
+    FVector up = { fwd.y*right.z - fwd.z*right.y,
+                   fwd.z*right.x - fwd.x*right.z,
+                   fwd.x*right.y - fwd.y*right.x };
+
+    FVector rolledUp = { up.x*cr - right.x*sr,
+                         up.y*cr - right.y*sr,
+                         up.z*cr - right.z*sr };
+
+    Matrix4x4 view = {};
+    view.M[0][0] = right.x;   view.M[0][1] = right.y;   view.M[0][2] = right.z;   view.M[0][3] = -(right.x*pos.x + right.y*pos.y + right.z*pos.z);
+    view.M[1][0] = rolledUp.x;view.M[1][1] = rolledUp.y;view.M[1][2] = rolledUp.z;view.M[1][3] = -(rolledUp.x*pos.x + rolledUp.y*pos.y + rolledUp.z*pos.z);
+    view.M[2][0] = fwd.x;     view.M[2][1] = fwd.y;     view.M[2][2] = fwd.z;     view.M[2][3] = -(fwd.x*pos.x + fwd.y*pos.y + fwd.z*pos.z);
+    view.M[3][0] = 0;         view.M[3][1] = 0;         view.M[3][2] = 0;         view.M[3][3] = 1;
+
+    float aspect = 16.0f / 9.0f;
+    if (g_Device) {
+        D3DVIEWPORT9 vp;
+        if (SUCCEEDED(g_Device->GetViewport(&vp)) && vp.Height > 0)
+            aspect = (float)vp.Width / (float)vp.Height;
+    }
+    float fovRad = fov * 3.14159265f / 180.0f;
+    float yScale = 1.0f / tanf(fovRad * 0.5f);
+    float xScale = yScale / aspect;
+
+    Matrix4x4 proj = {};
+    proj.M[0][0] = xScale;
+    proj.M[1][1] = yScale;
+    proj.M[2][2] = 1000.0f / (1000.0f - 0.01f);
+    proj.M[2][3] = -0.01f * 1000.0f / (1000.0f - 0.01f);
+    proj.M[3][2] = 1.0f;
+    proj.M[3][3] = 0;
+
+    MatrixMultiply(view, proj, g_ViewProj4x4);
+    g_ViewProjValid = true;
+}
+
+bool WorldToScreen(const FVector& world, Vector2& out) {
+    if (!g_ViewProjValid || !g_Device) return false;
+    D3DVIEWPORT9 vp;
+    if (FAILED(g_Device->GetViewport(&vp)) || vp.Height == 0) return false;
+    float sw = (float)vp.Width, sh = (float)vp.Height;
+
+    const Matrix4x4& m = g_ViewProj4x4;
+    float cx = m.M[0][0]*world.x + m.M[0][1]*world.y + m.M[0][2]*world.z + m.M[0][3];
+    float cy = m.M[1][0]*world.x + m.M[1][1]*world.y + m.M[1][2]*world.z + m.M[1][3];
+    float cw = m.M[3][0]*world.x + m.M[3][1]*world.y + m.M[3][2]*world.z + m.M[3][3];
+    if (cw <= 0.001f) return false;
+
+    float invW = 1.0f / cw;
+    float ndcX = cx * invW;
+    float ndcY = cy * invW;
+
+    out.x = (sw * 0.5f) + (ndcX * sw * 0.5f);
+    out.y = (sh * 0.5f) - (ndcY * sh * 0.5f);
+    return true;
+}
+
+void FindOffsets() {
+    if (!g_PC) return;
+    __try {
+        for (int i = 0x400; i < 0x750; i += 8) {
+            uintptr_t hud = *(uintptr_t*)(g_PC + i);
+            if (!ValidPtr(hud)) continue;
+            for (int k = 0x0; k < 0x1000; k += 8) {
+                if (k != 0x864 && k != 0x328) continue;
+                uintptr_t canv = *(uintptr_t*)(hud + k);
+                if (!ValidPtr(canv)) continue;
+                
+                uintptr_t sceneView = *(uintptr_t*)(canv + 0xB0);
+                if (!ValidPtr(sceneView)) continue;
+                
+                for (int m_off = 0x0; m_off < 0x200; m_off += 0x40) {
+                    float* m = (float*)(sceneView + m_off);
+                    if (fabsf(m[0]) > 0.0001f && fabsf(m[0]) < 10.0f) {
+                        if (fabsf(m[15]) <= 1.0f || fabsf(m[15]) < 0.0001f) {
+                            g_HudOffset = i; 
+                            g_CanvasOffset = k; 
+                            g_CanvasMatrixOffset = m_off; 
+                            g_OffsetsFound = true; 
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    } __except(1) {}
+}
+
+void ResetState() { 
+    g_PC = 0; 
+    g_YawOff = 0; 
+    g_OffsetsFound = false; 
+    g_ViewProjValid = false;
+    g_LocalPawn = 0;
+    g_PawnCache.clear();
+    g_CurrentTpTarget = 0;
+    g_RandomEnemyTarget = 0;
+    g_TpActive = false;
+    g_AutoRandomTpTarget = 0;
+    g_AutoRandomTpWasAlive = false;
+    g_AutoRandomTp2Target = 0;
+    g_AllEnemies.clear();
+    g_AllPawns.clear();
+    g_RandomTpPool.clear();
+}
+
+// ==================== MAIN GAME LOGIC ====================
+
+void RunEngineLogic() {
+    if (!API.GetTickCount) return;
+    __try {
+        if (!g_Base) g_Base = GetModuleBaseManual(NULL);
+        uintptr_t world = *(uintptr_t*)(g_Base + GWORLD_OFFSET);
+        if (!ValidPtr(world)) { ResetState(); g_LastWorld = 0; return; }
+        if (world != g_LastWorld) { ResetState(); g_LastWorld = world; g_MapStartTime = API.GetTickCount(); return; }
+        if (API.GetTickCount() - g_MapStartTime < 8000) return;
+
+        uintptr_t level = *(uintptr_t*)(world + 0x80);
+        if (!ValidPtr(level)) return;
+        uintptr_t root = *(uintptr_t*)(g_Base + EXCEPTION_INFO_PTR);
+        if (!ValidPtr(root)) return;
+        uintptr_t lpArray = *(uintptr_t*)(root + 0x750);
+        if (!ValidPtr(lpArray)) return;
+        uintptr_t lp = *(uintptr_t*)lpArray;
+        if (!ValidPtr(lp)) return;
+        g_PC = *(uintptr_t*)(lp + 0x68);
+        if (!ValidPtr(g_PC)) return;
+
+        if (!g_OffsetsFound) FindOffsets();
+
+        uintptr_t worldInfoPtr = *(uintptr_t*)(level + 0x60);
+        if (!ValidPtr(worldInfoPtr)) return;
+        uintptr_t worldInfo = *(uintptr_t*)worldInfoPtr; 
+        if (!ValidPtr(worldInfo)) return;
+        g_WorldInfo = worldInfo;
+
+        // Find local pawn
+        uintptr_t lpPawn = 0;
+        if (!SafeRead(g_PC + ASGPLAYERCONTROLLER_SGPAWN, &lpPawn) || !ValidPtr(lpPawn)) {
+            // Fallback: iterate to find pawn with matching controller
+            uintptr_t cp_ = 0;
+            if (SafeRead(worldInfo + 0x884, &cp_)) {
+                int safety = 0;
+                while (ValidPtr(cp_) && safety++ < 400) {
+                    uintptr_t controller = 0;
+                    if (SafeRead(cp_ + 0x388, &controller) && controller == g_PC) {
+                        lpPawn = cp_;
+                        break;
+                    }
+                    uintptr_t next = 0;
+                    if (!SafeRead(cp_ + 0x710, &next)) break;
+                    cp_ = next;
+                }
+            }
+        }
+
+        int myTeam = -1; 
+        g_LocalPawn = lpPawn;
+        if (ValidPtr(lpPawn)) {
+             myTeam = GetPawnTeam(lpPawn);
+             if (g_InfiniteLongJump) { 
+                 __try { *(float*)(lpPawn + 0x1A30) = 0.0f; } __except(1) {} 
+             }
+             
+             if (g_SkinChangerEnabled) {
+                 ApplySkinChanger();
+             }
+        }
+        
+        // Build enemy lists for TP
+        BuildEnemyLists();
+        
+        // ==================== CHAT SPAMMER ====================
+        if (g_ChatSpammerEnabled && ValidPtr(g_PC)) {
+            DWORD now = API.GetTickCount();
+            if ((now - g_LastChatSpamTime) >= (DWORD)(g_ChatSpamDelay * 1000.0f)) {
+                g_LastChatSpamTime = now;
+                
+                char cmd[350];
+                const char* messageToSend;
+                
+                if (g_ChatSpamFunnyMode) {
+                    messageToSend = g_FunnyMessages[rand() % g_FunnyMessagesCount];
+                } else {
+                    messageToSend = g_ChatSpamMessage;
+                }
+                
+                if (g_ChatSpamRandomize) {
+                    char prefix[5];
+                    char suffix[5];
+                    GenerateRandomString(prefix, 4);
+                    GenerateRandomString(suffix, 4);
+                    sprintf_s(cmd, "say [%s] %s [%s]", prefix, messageToSend, suffix);
+                } else {
+                    sprintf_s(cmd, "say %s", messageToSend);
+                }
+                
+                ExecuteConsoleCommand(cmd);
+                g_ChatSpamCount++;
+            }
+        }
+        
+        // ==================== CLAN TAG CHANGER ====================
+        if (g_ClanTagEnabled && ValidPtr(g_PC)) {
+            DWORD now = API.GetTickCount();
+            
+            if (g_ClanTagRandomMode) {
+                if ((now - g_LastClanTagChange) >= (DWORD)(g_ClanTagRotateInterval * 1000.0f)) {
+                    g_LastClanTagChange = now;
+                    g_CurrentClanTagIndex = (g_CurrentClanTagIndex + 1) % g_ClanTagCount;
+                    
+                    char cmd[64];
+                    sprintf_s(cmd, "setclantag %s", g_ClanTagList[g_CurrentClanTagIndex]);
+                    ExecuteConsoleCommand(cmd);
+                }
+            } else {
+                static bool tagSetThisSession = false;
+                static bool wasEnabled = false;
+                
+                if (g_ClanTagEnabled && !wasEnabled) {
+                    tagSetThisSession = false;
+                }
+                wasEnabled = g_ClanTagEnabled;
+                
+                if (!tagSetThisSession) {
+                    tagSetThisSession = true;
+                    char cmd[64];
+                    sprintf_s(cmd, "setclantag %s", g_ClanTagSingle);
+                    ExecuteConsoleCommand(cmd);
+                }
+            }
+        }
+
+        // ==================== VOTE-KICK DODGE (Linux-style) ====================
+        CheckVoteKickDodge();
+
+        if (ValidPtr(g_PC)) {
+            SetThirdPerson(g_ThirdPerson);
+            if (g_InfiniteLongJump) { 
+                __try { *(uint8_t*)(g_PC + 0x1450) |= 1; } __except(1) {} 
+            }
+        }
+
+        // Build view-projection matrix
+        static int viewProjSkipCounter = 0;
+        if (g_EspEnabled && (++viewProjSkipCounter >= 5 || !g_ViewProjValid)) {
+            viewProjSkipCounter = 0;
+            BuildViewProj();
+        }
+
+        FVector myLoc = {0,0,0}; 
+        FRotator myRot = {0,0,0};
+        GetPlayerViewPoint(myLoc, myRot);
+        
+        // YawOff detection
+        static int yawOffScanSkip = 0;
+        if (g_YawOff == 0 && myRot.yaw != 0 && ++yawOffScanSkip >= 30) {
+            yawOffScanSkip = 0;
+            for (int o = 0x80; o < 0x800; o += 4) {
+                if (*(int*)(g_PC + o) == myRot.yaw) { 
+                    g_YawOff = o; 
+                    break; 
+                }
+            }
+        }
+        
+        if (g_YawOff == 0) {
+            g_EnemyCount = 0;
+        }
+
+        // ==================== PAWN ESP CACHE ====================
+        g_PawnCache.clear();
+        g_PawnCache.reserve(64);
+        uintptr_t currentPawn = 0;
+        SafeRead(worldInfo + 0x884, &currentPawn);
+        uintptr_t bestT = 0; 
+        float bestD = 999999.0f; 
+        FVector tPos = {0,0,0};
+        
+        int s = 0;
+        int foundCount = 0;
+        float wTime = *(float*)(worldInfo + 0x79C);
+
+        while (ValidPtr(currentPawn) && s++ < 400) {
+            __try {
+                if (currentPawn == lpPawn) { 
+                    SafeRead(currentPawn + 0x710, &currentPawn); 
+                    continue; 
+                }
+                
+                if (!IsPawnAlive(currentPawn)) { 
+                    SafeRead(currentPawn + 0x710, &currentPawn); 
+                    continue; 
+                }
+                
+                int hp = 0;
+                SafeRead(currentPawn + 0x81C, &hp);
+
+                int team = GetPawnTeam(currentPawn);
+                bool isEnemy = (team != myTeam || team == -1);
+                if (g_TeamCheck && !isEnemy && !g_EspTeammates) { 
+                    SafeRead(currentPawn + 0x710, &currentPawn); 
+                    continue; 
+                }
+
+                bool isVisible = true;
+                if (g_VisibleCheck) {
+                    uintptr_t mesh = 0;
+                    SafeRead(currentPawn + 0x8E4, &mesh);
+                    if (ValidPtr(mesh)) {
+                        float rTime = 0.0f;
+                        SafeRead(mesh + 0x244, &rTime);
+                        isVisible = (wTime - rTime < 0.25f && wTime - rTime > -0.25f);
+                    } else isVisible = false;
+                }
+
+                FVector loc = {0,0,0};
+                if (!SafeReadFVector(currentPawn + 0x330, &loc)) {
+                    SafeReadFVector(currentPawn + 0x44, &loc);
+                }
+                if (loc.x == 0 && loc.y == 0 && loc.z == 0) {
+                    SafeRead(currentPawn + 0x710, &currentPawn);
+                    continue;
+                }
+                
+                int fullHeight = 0;
+                SafeRead(currentPawn + 0x73C, &fullHeight);
+                float cylinderHalfHeight = (fullHeight > 0 && fullHeight < 200) ? (float)fullHeight / 2.0f : 44.0f;
+                
+                FVector feetPos = { loc.x, loc.y, loc.z - cylinderHalfHeight };
+                FVector headPosVec = { loc.x, loc.y, loc.z + cylinderHalfHeight };
+                
+                Vector2 centerScreen, feetScreen, headScreen;
+                bool centerOk = WorldToScreen(loc, centerScreen);
+                bool feetOk = WorldToScreen(feetPos, feetScreen);
+                bool headOk = WorldToScreen(headPosVec, headScreen);
+                
+                if (centerOk && feetOk && headOk) {
+                    CachedPawn cp;
+                    
+                    cp.screenCenter = ImVec2(centerScreen.x, centerScreen.y);
+                    cp.sBase = ImVec2(feetScreen.x, feetScreen.y);
+                    cp.sHead = ImVec2(headScreen.x, headScreen.y);
+                    
+                    float boxHeight = fabsf(cp.sBase.y - cp.sHead.y);
+                    float boxWidth = boxHeight * 0.5f;
+                    
+                    cp.boxMin = ImVec2(cp.screenCenter.x - boxWidth / 2.0f, cp.sHead.y);
+                    cp.boxMax = ImVec2(cp.screenCenter.x + boxWidth / 2.0f, cp.sBase.y);
+                    
+                    cp.hp = hp; 
+                    int hpMax = 0;
+                    SafeRead(currentPawn + 0x820, &hpMax);
+                    cp.hpMax = hpMax;
+                    cp.team = team; 
+                    cp.isEnemy = isEnemy; 
+                    cp.isVisible = isVisible;
+                    cp.isDowned = false;
+                    cp.pawnPtr = currentPawn;
+                    
+                    strcpy_s(cp.name, "Player");
+                    if (g_NameCacheFrameCounter == 0) {
+                        bool foundName = false;
+                        for (auto& nc : g_PawnNames) {
+                            if (nc.pawnPtr == currentPawn) {
+                                strcpy_s(cp.name, nc.name);
+                                foundName = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!foundName) {
+                            uintptr_t pri = 0;
+                            SafeRead(currentPawn + 0x3F0, &pri);
+                            if (!ValidPtr(pri)) SafeRead(currentPawn + 0x898, &pri);
+                            if (ValidPtr(pri)) {
+                                char tempName[64];
+                                ReadFString(pri + 0x538, tempName, 64);
+                                if (tempName[0] != '\0') {
+                                    strcpy_s(cp.name, tempName);
+                                    
+                                    PawnNameCache nc;
+                                    nc.pawnPtr = currentPawn;
+                                    strcpy_s(nc.name, tempName);
+                                    nc.lastUpdate = API.GetTickCount();
+                                    g_PawnNames.push_back(nc);
+                                }
+                            }
+                        }
+                    } else {
+                        for (auto& nc : g_PawnNames) {
+                            if (nc.pawnPtr == currentPawn) {
+                                strcpy_s(cp.name, nc.name);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    g_PawnCache.push_back(cp);
+                }
+
+                // Aimbot target selection
+                if ((isEnemy || !g_TeamCheck) && g_AimbotEnabled) {
+                    if (g_VisibleCheck && !isVisible) { 
+                        SafeRead(currentPawn + 0x710, &currentPawn); 
+                        continue; 
+                    }
+                    
+                    if (hp <= 0) { 
+                        SafeRead(currentPawn + 0x710, &currentPawn); 
+                        continue; 
+                    }
+                    
+                    foundCount++;
+                    
+                    FVector aimPoint = GetDynamicAimPoint(currentPawn, g_AimTargetBone);
+                    if (aimPoint.x == 0 && aimPoint.y == 0 && aimPoint.z == 0) {
+                        aimPoint = GetDynamicAimPoint(currentPawn, 3);
+                    }
+                    
+                    FVector vel = {0,0,0};
+                    SafeReadFVector(currentPawn + 0x15c, &vel);
+                    float predFactor = 0.040f; 
+                    FVector pLoc = { 
+                        aimPoint.x + (vel.x * predFactor), 
+                        aimPoint.y + (vel.y * predFactor), 
+                        aimPoint.z + (vel.z * predFactor) 
+                    };
+                    
+                    if (isnan(pLoc.x) || isnan(pLoc.y) || isnan(pLoc.z) || 
+                        isinf(pLoc.x) || isinf(pLoc.y) || isinf(pLoc.z)) {
+                        SafeRead(currentPawn + 0x710, &currentPawn); 
+                        continue;
+                    }
+
+                    float dx = pLoc.x - myLoc.x, dy = pLoc.y - myLoc.y, dz = pLoc.z - myLoc.z;
+                    
+                    if (isnan(dx) || isnan(dy) || isnan(dz) || isinf(dx) || isinf(dy) || isinf(dz)) {
+                        SafeRead(currentPawn + 0x710, &currentPawn); 
+                        continue;
+                    }
+                    
+                    float yawReq = atan2f(dy, dx) * 57.2957f;
+                    float pitchReq = atan2f(dz, sqrtf(dx*dx + dy*dy)) * 57.2957f;
+                    float mY = (float)myRot.yaw / (UR_UNITS / 57.2957f);
+                    float mP = (float)myRot.pitch / (UR_UNITS / 57.2957f);
+                    float dY = fabsf(yawReq - mY); if (dY > 180.0f) dY = fabsf(360.0f - dY);
+                    float dP = fabsf(pitchReq - mP);
+
+                    float aimFov = g_FovCircleRadius * 0.075f;
+                    if (dY < aimFov && dP < aimFov) {
+                        float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                        if (d < bestD && d > 0.1f && d < 50000.0f) {
+                            bestD = d; 
+                            bestT = currentPawn; 
+                            tPos = pLoc;
+                        }
+                    }
+                }
+            } __except(1) {}
+            uintptr_t nextPawn = 0;
+            if (!SafeRead(currentPawn + 0x710, &nextPawn)) break;
+            currentPawn = nextPawn;
+        }
+        g_EnemyCount = foundCount;
+
+        // ==================== AIMBOT ====================
+        bool isKeyDown = (API.GetAsyncKeyState(g_AimKey) & 0x8000) != 0;
+        bool justPressed = isKeyDown && !g_WasKeyDown;
+        g_WasKeyDown = isKeyDown;
+
+        // Bone toggle
+        bool isBoneToggleKeyDown = (API.GetAsyncKeyState(g_BoneToggleKey) & 0x8000) != 0;
+        bool justBoneTogglePressed = isBoneToggleKeyDown && !g_BoneToggleKeyWasDown;
+        g_BoneToggleKeyWasDown = isBoneToggleKeyDown;
+        
+        if (justBoneTogglePressed) {
+            if (g_AimTargetBone == 0) {
+                g_AimTargetBone = g_SavedBoneMode;
+            } else {
+                g_SavedBoneMode = g_AimTargetBone;
+                g_AimTargetBone = 0;
+            }
+        }
+
+        // ==================== TP LOGIC ====================
+        bool inputBlocked = IsConsoleBlockingInput();
+        bool isTpKeyDown = !inputBlocked && ((API.GetAsyncKeyState(g_TpKey) & 0x8000) != 0);
+        bool justTpPressed = isTpKeyDown && !g_TpWasKeyDown;
+        g_TpWasKeyDown = isTpKeyDown;
+        
+        // Update current TP target for FOV mode
+        if (g_TpEnabled && g_TpMode == 0) {
+            g_CurrentTpTarget = GetClosestEnemyInFOV(myLoc, myRot);
+        } else {
+            g_CurrentTpTarget = 0;
+        }
+        
+        DWORD now = API.GetTickCount();
+        
+        // Continuous follow for TP modes
+        if (!inputBlocked && g_TpActive && (now - g_LastLocationCheck) >= 50) {
+            g_LastLocationCheck = now;
+            bool isMovementKeyPressed = 
+                (API.GetAsyncKeyState('W') & 0x8000) || 
+                (API.GetAsyncKeyState('A') & 0x8000) || 
+                (API.GetAsyncKeyState('S') & 0x8000) || 
+                (API.GetAsyncKeyState('D') & 0x8000);
+            
+            if (isMovementKeyPressed) {
+                g_TpActive = false;
+                g_LastPlayerLocation = myLoc;
+            } else {
+                uintptr_t targetToFollow = 0;
+                
+                if (g_TpMode == 0) {
+                    targetToFollow = g_CurrentTpTarget;
+                } else if (g_TpMode == 1) {
+                    targetToFollow = g_RandomEnemyTarget;
+                } else if (g_TpMode == 4) {
+                    targetToFollow = g_AutoRandomTpTarget;
+                } else if (g_TpMode == 5) {
+                    targetToFollow = g_AutoRandomTp2Target;
+                }
+                
+                if (ValidPtr(targetToFollow)) {
+                    FVector targetLoc;
+                    if (SafeReadFVector(targetToFollow + ACTOR_LOCATION, &targetLoc)) {
+                        TeleportPlayer(lpPawn, targetLoc);
+                    }
+                }
+            }
+        }
+        
+        // ==================== AUTO RANDOM TP MODE 4 (on kill) ====================
+        if (!inputBlocked && g_TpEnabled && g_TpMode == 4 && g_AutoRandomTpEnabled) {
+            bool needNewTarget = false;
+
+            if (!ValidPtr(g_AutoRandomTpTarget)) {
+                needNewTarget = true;
+            } else {
+                bool alive = IsPawnAlive(g_AutoRandomTpTarget);
+                bool inPool = false;
+                for (uintptr_t p : g_RandomTpPool) {
+                    if (p == g_AutoRandomTpTarget) { inPool = true; break; }
+                }
+                if (!alive || !inPool) {
+                    needNewTarget = true;
+                }
+            }
+
+            if (needNewTarget) {
+                uintptr_t t = 0;
+                if (!g_RandomTpPool.empty()) {
+                    t = g_RandomTpPool[rand() % g_RandomTpPool.size()];
+                }
+                if (ValidPtr(t)) {
+                    FVector tloc;
+                    if (SafeReadFVector(t + ACTOR_LOCATION, &tloc)) {
+                        TeleportPlayer(lpPawn, tloc);
+                        OrientAtTarget(lpPawn, tloc);
+                        g_AutoRandomTpTarget   = t;
+                        g_AutoRandomTpWasAlive = true;
+                        g_TpActive             = true;
+                        g_LastLocationCheck    = now;
+                    }
+                }
+            }
+        } else {
+            if (g_TpMode != 4) {
+                g_AutoRandomTpTarget   = 0;
+                g_AutoRandomTpWasAlive = false;
+            }
+            if (g_TpMode == 4) g_TpActive = false;
+        }
+
+        // ==================== AUTO RANDOM TP MODE 5 (timed) ====================
+        if (!inputBlocked && g_TpEnabled && g_TpMode == 5 && g_AutoRandomTp2Enabled) {
+            DWORD ivMs = (DWORD)(g_AutoRandomTp2Interval * 1000.0f);
+            if (ivMs < 1000) ivMs = 1000;
+            if (ivMs > 5000) ivMs = 5000;
+
+            if ((now - g_LastAutoRandomTp2) >= ivMs) {
+                uintptr_t t = GetRandomTargetExcluding(g_AutoRandomTp2Target, &g_AutoRandomTp2Target);
+                if (ValidPtr(t)) {
+                    FVector tloc;
+                    if (SafeReadFVector(t + ACTOR_LOCATION, &tloc)) {
+                        TeleportPlayer(lpPawn, tloc);
+                        OrientAtTarget(lpPawn, tloc);
+                        g_LastAutoRandomTp2 = now;
+                        g_TpActive          = true;
+                        g_LastLocationCheck = now;
+                    }
+                }
+            }
+        } else {
+            if (g_TpMode != 5) {
+                g_LastAutoRandomTp2 = 0;
+            }
+            if (g_TpMode == 5) g_TpActive = false;
+        }
+        
+        // ==================== TP ACTIVATION ====================
+        if (!inputBlocked && g_TpEnabled && justTpPressed) {
+            if ((now - g_LastTpTime) > (DWORD)(g_TpCooldown * 1000.0f)) {
+                g_LastTpTime = now;
+                
+                uintptr_t tpTarget = 0;
+                FVector tpLoc = {0,0,0};
+                
+                switch (g_TpMode) {
+                    case 0: {
+                        tpTarget = GetClosestEnemyInFOV(myLoc, myRot);
+                        if (ValidPtr(tpTarget)) {
+                            SafeReadFVector(tpTarget + ACTOR_LOCATION, &tpLoc);
+                            PerformTP(lpPawn, tpLoc);
+                            g_CurrentTpTarget = tpTarget;
+                            g_TpActive = true;
+                            g_LastPlayerLocation = myLoc;
+                            g_LastLocationCheck = now;
+                        }
+                        break;
+                    }
+                    case 1: {
+                        tpTarget = GetRandomTarget();
+                        if (ValidPtr(tpTarget)) {
+                            SafeReadFVector(tpTarget + ACTOR_LOCATION, &tpLoc);
+                            PerformTP(lpPawn, tpLoc);
+                            g_TpActive = true;
+                            g_LastPlayerLocation = myLoc;
+                            g_LastLocationCheck = now;
+                        } else {
+                            g_TpActive = false;
+                        }
+                        break;
+                    }
+                    case 2: {
+                        tpTarget = GetRandomDownedTeammate(myTeam);
+                        if (ValidPtr(tpTarget)) {
+                            SafeReadFVector(tpTarget + ACTOR_LOCATION, &tpLoc);
+                            PerformTP(lpPawn, tpLoc);
+                            g_TpActive = false;
+                        }
+                        break;
+                    }
+                    case 3: {
+                        FVector hitLoc = {0,0,0};
+                        uintptr_t hitActor = 0;
+                        if (GetCrosshairTraceData(g_PC, hitLoc, hitActor)) {
+                            PerformTP(lpPawn, hitLoc);
+                            g_TpActive = false;
+                        }
+                        break;
+                    }
+                    case 4: {
+                        uintptr_t t = 0;
+                        if (!g_RandomTpPool.empty()) {
+                            t = g_RandomTpPool[rand() % g_RandomTpPool.size()];
+                        }
+                        if (ValidPtr(t)) {
+                            SafeReadFVector(t + ACTOR_LOCATION, &tpLoc);
+                            PerformTP(lpPawn, tpLoc);
+                            g_AutoRandomTpTarget   = t;
+                            g_AutoRandomTpWasAlive = true;
+                            g_TpActive             = true;
+                            g_LastLocationCheck    = now;
+                        }
+                        break;
+                    }
+                    case 5: {
+                        uintptr_t t = GetRandomTargetExcluding(g_AutoRandomTp2Target, &g_AutoRandomTp2Target);
+                        if (ValidPtr(t)) {
+                            SafeReadFVector(t + ACTOR_LOCATION, &tpLoc);
+                            PerformTP(lpPawn, tpLoc);
+                            g_LastAutoRandomTp2 = now;
+                            g_TpActive          = true;
+                            g_LastLocationCheck = now;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ==================== AUTO SHOOT ====================
+        if (!inputBlocked && g_AutoShootEnabled && ValidPtr(g_PC)) {
+            __try {
+                static bool s_ToggleState = false;
+                static bool s_KeyWasDown = false;
+
+                bool keyDown = (API.GetAsyncKeyState(g_AutoShootKey) & 0x8000) != 0;
+                bool autoJustPressed = keyDown && !s_KeyWasDown;
+                s_KeyWasDown = keyDown;
+
+                bool active;
+                if (g_AutoShootToggleMode) {
+                    if (autoJustPressed) s_ToggleState = !s_ToggleState;
+                    active = s_ToggleState;
+                } else {
+                    active = keyDown;
+                }
+
+                if (active) {
+                    bool shouldShoot = true;
+                    
+                    if (g_AutoShootTeamCheck) {
+                        uintptr_t tracePtr = g_PC + 0x1828;
+                        bool traceValid = false;
+                        SafeRead(tracePtr + 0x0, &traceValid);
+                        
+                        if (traceValid) {
+                            uintptr_t hitActor = 0;
+                            SafeRead(tracePtr + 0x4, &hitActor);
+                            if (ValidPtr(hitActor)) {
+                                int hitTeam = GetPawnTeam(hitActor);
+                                if (hitTeam == myTeam && hitTeam != -1) {
+                                    shouldShoot = false;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (shouldShoot) {
+                        DWORD nowShoot = API.GetTickCount();
+                        if ((nowShoot - g_LastAutoShootShot) >= (DWORD)g_AutoShootDelay) {
+                            INPUT in = {0};
+                            in.type = INPUT_MOUSE;
+                            in.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                            SendInput(1, &in, sizeof(INPUT));
+                            in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                            SendInput(1, &in, sizeof(INPUT));
+                            g_LastAutoShootShot = nowShoot;
+                        }
+                    }
+                }
+            } __except(1) {}
+        }
+
+        // ==================== REAL TRIGGERBOT ====================
+        if (!inputBlocked && g_RealTriggerbotEnabled && ValidPtr(g_PC)) {
+            __try {
+                bool isRealTriggerKeyDown = (API.GetAsyncKeyState(g_RealTriggerbotKey) & 0x8000) != 0;
+                
+                if (isRealTriggerKeyDown) {
+                    uintptr_t tracePtr = g_PC + 0x1828;
+                    bool traceValid = false;
+                    SafeRead(tracePtr + 0x0, &traceValid);
+                    
+                    if (traceValid) {
+                        uintptr_t hitActor = 0;
+                        SafeRead(tracePtr + 0x4, &hitActor);
+                        
+                        if (ValidPtr(hitActor)) {
+                            int hitTeam = GetPawnTeam(hitActor);
+                            bool isEnemy = (hitTeam != myTeam || hitTeam == -1);
+                            
+                            if (!g_RealTriggerbotTeamCheck || isEnemy) {
+                                DWORD nowShoot = API.GetTickCount();
+                                if ((nowShoot - g_LastRealTriggerbotShot) >= (DWORD)g_RealTriggerbotDelay) {
+                                    INPUT in = {0};
+                                    in.type = INPUT_MOUSE;
+                                    in.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                                    SendInput(1, &in, sizeof(INPUT));
+                                    in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                                    SendInput(1, &in, sizeof(INPUT));
+                                    g_LastRealTriggerbotShot = nowShoot;
+                                }
+                            }
+                        }
+                    }
+                }
+            } __except(1) {}
+        }
+
+        // ==================== DEFIB AUTO-REVIVE ====================
+        if (!inputBlocked && g_DefibAutoRevive && ValidPtr(g_PC)) {
+            __try {
+                bool isTriggerKeyDown = 
+                    (API.GetAsyncKeyState(g_AutoShootKey) & 0x8000) || 
+                    (API.GetAsyncKeyState(g_RealTriggerbotKey) & 0x8000);
+                
+                if (isTriggerKeyDown) {
+                    uintptr_t tracePtr = g_PC + 0x1828;
+                    bool traceValid = false;
+                    SafeRead(tracePtr + 0x0, &traceValid);
+                    
+                    if (traceValid) {
+                        uintptr_t hitActor = 0;
+                        SafeRead(tracePtr + 0x4, &hitActor);
+                        
+                        if (ValidPtr(hitActor)) {
+                            int hitTeam = GetPawnTeam(hitActor);
+                            bool isTeammate = (hitTeam == myTeam && hitTeam != -1);
+                            
+                            if (isTeammate && IsPawnDowned(hitActor)) {
+                                DWORD nowClick = API.GetTickCount();
+                                if ((nowClick - g_LastAutoShootShot) >= 50) {
+                                    INPUT in = {0};
+                                    in.type = INPUT_MOUSE;
+                                    in.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                                    SendInput(1, &in, sizeof(INPUT));
+                                    in.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                                    SendInput(1, &in, sizeof(INPUT));
+                                    g_LastAutoShootShot = nowClick;
+                                }
+                            }
+                        }
+                    }
+                }
+            } __except(1) {}
+        }
+
+        // ==================== AIMBOT EXECUTION ====================
+        if (bestT && g_YawOff && ValidPtr(g_PC)) {
+            bool valid = !isnan(tPos.x) && !isnan(tPos.y) && !isnan(tPos.z) &&
+                         !isnan(myLoc.x) && !isnan(myLoc.y) && !isnan(myLoc.z) &&
+                         ValidPtr(bestT);
+            
+            if (valid) {
+                float dx = tPos.x - myLoc.x, dy = tPos.y - myLoc.y, dz = tPos.z - myLoc.z;
+                float d2d = sqrtf(dx * dx + dy * dy);
+                
+                if (d2d > 0.1f && d2d < 100000.0f) {
+                    int targetYaw = (int)(atan2f(dy, dx) * UR_UNITS) - 27;
+                    int targetPitch = (int)(atan2f(dz, d2d) * UR_UNITS);
+            
+                    if (g_SilentAim) {
+                        DWORD nowAim = API.GetTickCount();
+                        if (justPressed && (nowAim - g_LastSilentAimTime) > g_SilentAimCooldown) {
+                            __try {
+                                if (ValidPtr(g_PC) && g_YawOff > 0) {
+                                    int testRead = *(int*)(g_PC + g_YawOff);
+                                    *(int*)(g_PC + g_YawOff) = targetYaw;
+                                    *(int*)(g_PC + g_YawOff - 4) = targetPitch;
+                                    g_LastSilentAimTime = nowAim;
+                                }
+                            } __except(1) {
+                                g_YawOff = 0;
+                                bestT = 0;
+                            }
+                        }
+                    } else if (isKeyDown) {
+                        __try {
+                            if (g_Smoothing <= 1.05f) {
+                                *(int*)(g_PC + g_YawOff) = targetYaw;
+                                *(int*)(g_PC + g_YawOff - 4) = targetPitch;
+                            } else {
+                                int curY = *(int*)(g_PC + g_YawOff), curP = *(int*)(g_PC + g_YawOff - 4);
+                                int diffY = targetYaw - curY, diffP = targetPitch - curP;
+                                if (diffY > 32768) diffY -= 65536; 
+                                if (diffY < -32768) diffY += 65536;
+                                float f = 1.0f / g_Smoothing;
+                                if (g_SmoothType == 1) {
+                                    float dist = sqrtf((float)diffY * diffY + (float)diffP * diffP);
+                                    float t = dist / 2000.0f; 
+                                    if (t > 1.0f) t = 1.0f;
+                                    f *= (0.2f + (1.0f / (1.0f + expf(-10.0f * (t - 0.5f)))) * 0.8f);
+                                }
+                                if (g_AimJitter > 0.1f) { 
+                                    diffY += (rand() % 20 - 10); 
+                                    diffP += (rand() % 20 - 10); 
+                                }
+                                *(int*)(g_PC + g_YawOff) = curY + (int)((float)diffY * f);
+                                *(int*)(g_PC + g_YawOff - 4) = curP + (int)((float)diffP * f);
+                            }
+                        } __except(1) {
+                            g_YawOff = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ==================== WEAPON MODS ====================
+        if (ValidPtr(lpPawn)) {
+            uintptr_t weapon = 0;
+            SafeRead(lpPawn + APAWN_WEAPON, &weapon);
+            
+            if (ValidPtr(weapon)) {
+                // Viewmodel
+                SafeWriteFloat(weapon + 0x868, g_VmX);
+                SafeWriteFloat(weapon + 0x86C, g_VmY);
+                SafeWriteFloat(weapon + 0x870, g_VmZ);
+                
+                // ==================== ONE HIT KILL ====================
+                if (g_ProjectilesPerShotEnabled) {
+                    WriteTArrayInt32First(weapon + ASGWEAPON_PROJECTILESPERSSHOT,
+                                          g_ProjectilesPerShotValue);
+                }
+                
+                // ==================== RAPID FIRE ====================
+                if (g_RapidFire) {
+                    if (g_FireRate >= 0.001f && g_FireRate <= 10.0f && 
+                        !isnan(g_FireRate) && !isinf(g_FireRate)) {
+                        SafeWriteFloat(weapon + WEAPON_FIREINTERVALMODIFIED, g_FireRate);
+                        SafeWriteFloat(weapon + WEAPON_NEXTFIRETIME, 0.0f);
+                    }
+                }
+                
+                // ==================== INFINITE AMMO ====================
+                if (g_InfiniteAmmo) {
+                    __try {
+                        uintptr_t shotCostArray = weapon + 0x1658;
+                        uintptr_t shotCostData = *(uintptr_t*)shotCostArray;
+                        int shotCostCount = *(int*)(shotCostArray + 8);
+                        
+                        if (ValidPtr(shotCostData) && shotCostCount > 0 && shotCostCount < 10) {
+                            for (int i = 0; i < shotCostCount && i < 4; i++) {
+                                *(int32_t*)(shotCostData + (i * 4)) = 0;
+                            }
+                        }
+                    } __except(1) {}
+                }
+                
+                // ==================== DEFIB LEGACY ====================
+                if (g_InstantDefibCharge) {
+                    __try {
+                        float currentCharge = *(float*)(weapon + 0x17d0);
+                        if (currentCharge >= 0.0f && currentCharge <= 1.0f && 
+                            !isnan(currentCharge) && !isinf(currentCharge)) {
+                            *(float*)(weapon + 0x17d0) = 1.0f;
+                            *(float*)(weapon + 0x17d4) = 1.0f;
+                            
+                            float currentRate = *(float*)(weapon + 0x1768);
+                            if (currentRate >= 0.0f && currentRate < 10000.0f && 
+                                !isnan(currentRate) && !isinf(currentRate)) {
+                                *(float*)(weapon + 0x1768) = 999.0f;
+                            }
+                        }
+                    } __except(1) {}
+                }
+                
+                if (g_MaxDefibDamage) {
+                    __try {
+                        int minHealth = *(int32_t*)(weapon + 0x1760);
+                        int maxHealth = *(int32_t*)(weapon + 0x1764);
+                        
+                        if (minHealth >= 0 && minHealth < 200 && maxHealth >= 0 && maxHealth < 200) {
+                            if (minHealth > 0 || maxHealth > 0) {
+                                *(int32_t*)(weapon + 0x1760) = 120;
+                                *(int32_t*)(weapon + 0x1764) = 120;
+                                
+                                float reviveRange = *(float*)(weapon + 0x16a8);
+                                float damageRange = *(float*)(weapon + 0x16ac);
+                                
+                                if (reviveRange >= 0.0f && reviveRange < 10000.0f && !isnan(reviveRange) && !isinf(reviveRange)) {
+                                    *(float*)(weapon + 0x16a8) = 200.0f * g_DefibRangeMultiplier;
+                                }
+                                if (damageRange >= 0.0f && damageRange < 10000.0f && !isnan(damageRange) && !isinf(damageRange)) {
+                                    *(float*)(weapon + 0x16ac) = 200.0f * g_DefibRangeMultiplier;
+                                }
+                            }
+                        }
+                    } __except(1) {}
+                }
+                
+                // ==================== MELEE ENHANCEMENTS (Linux-style) ====================
+                bool isMelee = false;
+                SafeRead(weapon + AWEAPON_BMELEEWEAPON, &isMelee);
+                
+                // Fast melee
+                if (g_FastMelee && isMelee) {
+                    SafeWriteFloat(weapon + WEAPON_FIREINTERVALMODIFIED, g_MeleeFireInterval);
+                    SafeWriteFloat(weapon + WEAPON_FIREINTERVALAUGMENTMOD, 0.0f);
+
+                    uintptr_t fiData = 0;
+                    int32_t fiCount = 0;
+                    if (SafeRead(weapon + AWEAPON_FIREINTERVAL, &fiData) && ValidPtr(fiData)) {
+                        if (SafeRead(weapon + AWEAPON_FIREINTERVAL_COUNT_OFF, &fiCount)) {
+                            int maxWrite = (fiCount > 0 && fiCount < 8) ? fiCount : 2;
+                            for (int i = 0; i < maxWrite; i++) {
+                                SafeWriteFloat(fiData + (i * 4), g_MeleeFireInterval);
+                            }
+                        }
+                    }
+
+                    if (g_FastMeleeForceNextFire && g_MeleeFireInterval < 0.5f) {
+                        SafeWriteFloat(weapon + WEAPON_NEXTFIRETIME, 0.0f);
+                    }
+                }
+                
+                // Melee range (Linux-style)
+                if (g_MeleeRange && isMelee) {
+                    uintptr_t proxy = 0;
+                    bool proxyOk = false;
+                    if (SafeRead(weapon + SGMELEE_M_CURRENTACTIVEPROXY, &proxy) && ValidPtr(proxy)) {
+                        proxyOk = true;
+                    } else if (SafeRead(weapon + SGMELEE_M_IMPACTPROXY, &proxy) && ValidPtr(proxy)) {
+                        proxyOk = true;
+                    }
+
+                    if (proxyOk) {
+                        uintptr_t collComp = 0;
+                        if (SafeRead(proxy + IMPACTPROXY_MELECOLLISIONCOMP, &collComp) && ValidPtr(collComp)) {
+                            SafeWriteFloat(collComp + PRIMCOMP_BOUNDSSCALE, g_MeleeBoundsScale);
+                            if (g_MeleeVisualScale) {
+                                float s = g_MeleeBoundsScale;
+                                SafeWriteFloat(collComp + PRIMCOMP_SCALE, s);
+                                SafeWriteVector3(collComp + PRIMCOMP_SCALE3D, s, s, s);
+                            }
+                            if (g_MeleeWideAngle)
+                                SafeWriteFloat(weapon + SGMELEE_M_MAXIMPACTPROXYHITDOT, g_MeleeHitDot);
+
+                            if (g_MeleePushForward && g_MeleeForwardOffset != 0.0f) {
+                                ApplyMeleeForwardOffset(proxy, collComp, g_MeleeForwardOffset);
+                            }
+                        }
+                    }
+                }
+                
+                // Legacy melee enhancements
+                if (g_MeleeEnhanced) {
+                    __try {
+                        float currentBackstabMult = *(float*)(weapon + 0x1634);
+                        
+                        if (currentBackstabMult >= 0.1f && currentBackstabMult < 1000.0f && 
+                            !isnan(currentBackstabMult) && !isinf(currentBackstabMult) &&
+                            g_BackstabMultiplier >= 1.0f && g_BackstabMultiplier <= 100.0f &&
+                            !isnan(g_BackstabMultiplier) && !isinf(g_BackstabMultiplier)) {
+                            
+                            int safeAngle = (g_BackstabAngleSlider < 0) ? 0 : 
+                                           (g_BackstabAngleSlider > 180) ? 180 : g_BackstabAngleSlider;
+                            int ue3Angle = (int)((float)safeAngle * 182.044f);
+                            
+                            *(float*)(weapon + 0x1634) = g_BackstabMultiplier;
+                            *(int32_t*)(weapon + 0x1630) = ue3Angle;
+                            
+                            if (g_MeleeReachMultiplier >= 1.0f && g_MeleeReachMultiplier <= 10.0f &&
+                                !isnan(g_MeleeReachMultiplier) && !isinf(g_MeleeReachMultiplier)) {
+                                float reachDot = 1.0f - (g_MeleeReachMultiplier * 0.05f);
+                                if (reachDot < -1.0f) reachDot = -1.0f;
+                                if (reachDot > 1.0f) reachDot = 1.0f;
+                                *(float*)(weapon + 0x1678) = reachDot;
+                            }
+                        }
+                    } __except(1) {}
+                }
+            }
+            
+            // No recoil
+            if (g_NoRecoil) {
+                __try {
+                    *(int*)(lpPawn + 0x1ACC) = 0; 
+                    *(int*)(lpPawn + 0x1AD0) = 0; 
+                    *(int*)(lpPawn + 0x1AD4) = 0;
+                } __except(1) {}
+                
+                SafeWriteFloat(weapon + WEAPON_SPREADRECOVERYTIME, 0.0f);
+            }
+            
+            // No spread
+            if (g_NoSpread) {
+                SafeWriteFloat(weapon + 0x13dc, g_CustomSpreadValue);
+                SafeWriteFloat(weapon + 0x13e0, g_CustomSpreadValue);
+            }
+        }
+        
+        g_DebugPawnCount = s;
+        
+        // Name cache frame counter
+        g_NameCacheFrameCounter++;
+        if (g_NameCacheFrameCounter >= NAME_CACHE_INTERVAL) g_NameCacheFrameCounter = 0;
+        
+        // Cache cleanup
+        static int g_CacheCleanupCounter = 0;
+        g_CacheCleanupCounter++;
+        
+        if (g_CacheCleanupCounter >= 600 && API.GetTickCount) {
+            g_CacheCleanupCounter = 0;
+            DWORD cleanupNow = API.GetTickCount();
+            
+            if (g_PawnNames.size() > 50) {
+                int toRemove = g_PawnNames.size() - 30;
+                if (toRemove > 0) {
+                    g_PawnNames.erase(g_PawnNames.begin(), g_PawnNames.begin() + toRemove);
+                }
+            }
+            
+            auto it = g_PawnNames.begin();
+            while (it != g_PawnNames.end() && g_PawnNames.size() > 10) {
+                if ((cleanupNow - it->lastUpdate) > 8000) {
+                    it = g_PawnNames.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    } __except(1) {}
+}
+
+// ==================== ESP ====================
+
+void DrawESP() {
+    if (!g_Device || !g_EspEnabled) return;
+    
+    __try {
+        D3DVIEWPORT9 vp; 
+        g_Device->GetViewport(&vp);
+        if (g_FovCircleEnabled)
+            ImGui::GetForegroundDrawList()->AddCircle(ImVec2((float)vp.Width / 2, (float)vp.Height / 2), g_FovCircleRadius, IM_COL32_WHITE, 100, 2);
+    } __except(1) {
+        return;
+    }
+
+    if (g_PawnCache.empty()) return;
+
+    auto drawList = ImGui::GetForegroundDrawList();
+    if (!drawList) return;
+    
+    int maxDraw = (g_PawnCache.size() < 100) ? (int)g_PawnCache.size() : 100;
+    
+    for (int idx = 0; idx < maxDraw; idx++) {
+        const auto& cp = g_PawnCache[idx];
+        ImU32 col;
+        
+        if (cp.isDowned && !cp.isEnemy) {
+            col = IM_COL32(255, 165, 0, 255);
+        }
+        else if (g_TpEnabled && g_TpMode == 0 && cp.pawnPtr == g_CurrentTpTarget && cp.isEnemy) {
+            col = IM_COL32(144, 238, 144, 255);
+        }
+        else if (!cp.isEnemy) {
+            col = IM_COL32(0, 150, 255, 255);
+        } else {
+            if (g_VisibleCheck) {
+                col = cp.isVisible ? IM_COL32(0, 255, 0, 255) : IM_COL32(255, 0, 0, 255);
+            } else {
+                col = IM_COL32(255, 0, 0, 255);
+            }
+        }
+
+        if (g_EspBox) {
+            drawList->AddRect(ImVec2(cp.boxMin.x, cp.boxMin.y), ImVec2(cp.boxMax.x, cp.boxMax.y), col);
+        }
+        
+        if (g_EspTracers && g_Device) {
+            D3DVIEWPORT9 vp; 
+            g_Device->GetViewport(&vp);
+            ImVec2 screenCenter = ImVec2((float)vp.Width / 2.0f, (float)vp.Height);
+            drawList->AddLine(screenCenter, cp.screenCenter, col, 1.5f);
+        }
+
+        if (g_EspHealth) {
+            float h = fabsf(cp.boxMax.y - cp.boxMin.y);
+            float pct = (cp.hpMax > 0) ? (float)cp.hp / (float)cp.hpMax : 0.0f;
+            if (pct > 1.0f) pct = 1.0f;
+            ImU32 hpCol = IM_COL32(0, 255, 0, 255);
+            if (pct < 0.3f) hpCol = IM_COL32(255, 0, 0, 255);
+            else if (pct < 0.6f) hpCol = IM_COL32(255, 255, 0, 255);
+            drawList->AddRectFilled(ImVec2(cp.boxMin.x - 6, cp.boxMin.y), ImVec2(cp.boxMin.x - 2, cp.boxMax.y), IM_COL32(0, 0, 0, 150));
+            drawList->AddRectFilled(ImVec2(cp.boxMin.x - 5, cp.boxMax.y - (h * pct)), ImVec2(cp.boxMin.x - 3, cp.boxMax.y), hpCol);
+        }
+        
+        if (g_EspNames && cp.name[0] != '\0' && strcmp(cp.name, "Unknown") != 0) {
+            ImVec2 textSize = ImGui::CalcTextSize(cp.name);
+            ImVec2 namePos = ImVec2((cp.boxMin.x + cp.boxMax.x) / 2.0f - textSize.x / 2.0f, cp.boxMin.y - 18.0f);
+            drawList->AddText(ImVec2(namePos.x + 1, namePos.y + 1), IM_COL32(0, 0, 0, 200), cp.name);
+            drawList->AddText(namePos, col, cp.name);
+        }
+    }
+}
+
+// ==================== MENU ====================
+
+void DrawMenu() {
+    if (!g_ShowMenu) return;
+    ImGui::SetNextWindowSize(ImVec2(640, 800), ImGuiCond_FirstUseEver);
+    ImGui::Begin(X("Dirty Bomb Aimbot v3"), &g_ShowMenu);
+    if (ImGui::BeginTabBar(X("T"))) {
+        // ==================== LEGIT AIMBOT TAB ====================
+        if (ImGui::BeginTabItem(X("Legit Aimbot"))) {
+            ImGui::Text(X("Status: %d Targets Found"), g_EnemyCount);
+            ImGui::Checkbox(X("Enabled"), &g_AimbotEnabled);
+            ImGui::SameLine();
+            ImGui::Checkbox(X("Team Check"), &g_TeamCheck);
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("Aimbot Mode"));
+            ImGui::Checkbox(X("Silent Aim (Instant Snap)"), &g_SilentAim);
+            if (g_SilentAim) {
+                ImGui::TextColored(ImVec4(0, 1, 0, 1), X("Bullets lock to target on FIRST CLICK only"));
+                ImGui::SliderInt(X("Cooldown (ms)"), &g_SilentAimCooldown, 10, 500);
+            } else {
+                ImGui::SliderFloat(X("Smoothing"), &g_Smoothing, 1, 100);
+                ImGui::Combo(X("Smooth Type"), &g_SmoothType, "Linear\0Sigmoid (Human)\0");
+                ImGui::SliderFloat(X("Aim Jitter"), &g_AimJitter, 0, 5);
+            }
+            
+            ImGui::SliderFloat(X("Aimbot Z Offset"), &g_ZOffset, -50, 50);
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("Dynamic Bone Targeting"));
+            ImGui::Combo(X("Target Location"), &g_AimTargetBone, g_BoneNames, 4);
+            
+            const char* toggleKeys[] = { "F1", "F2", "F3", "F4", "F5", "F6", "T", "G", "H", "X", "Z" };
+            int toggleKeyCodes[] = { VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, 'T', 'G', 'H', 'X', 'Z' };
+            int curToggleK = 1;
+            for(int i=0; i<11; i++) if(g_BoneToggleKey == toggleKeyCodes[i]) { curToggleK = i; break; }
+            if (ImGui::Combo(X("Bone Toggle Key"), &curToggleK, toggleKeys, 11)) g_BoneToggleKey = toggleKeyCodes[curToggleK];
+            
+            const char* keys[] = { "Left Click", "Right Click", "Middle Click", "Mouse 4", "Mouse 5", "Shift", "V", "CAPS" };
+            int keyCodes[] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2, VK_SHIFT, 'V', VK_CAPITAL };
+            int curK = 0; for(int i=0; i<8; i++) if(g_AimKey == keyCodes[i]) curK = i;
+            if (ImGui::Combo(X("Aim Key"), &curK, keys, 8)) g_AimKey = keyCodes[curK];
+
+            ImGui::Separator();
+            ImGui::Checkbox(X("Visible Check"), &g_VisibleCheck);
+            ImGui::Checkbox(X("Show FOV Circle"), &g_FovCircleEnabled);
+            ImGui::SliderFloat(X("FOV Radius"), &g_FovCircleRadius, 10, 800);
+            
+            ImGui::Separator();
+            ImGui::Checkbox(X("Third Person View"), &g_ThirdPerson);
+            if (g_ThirdPerson) ImGui::SliderFloat(X("Camera Distance"), &g_ThirdPersonDistance, 50.0f, 500.0f);
+            ImGui::Checkbox(X("No Recoil"), &g_NoRecoil);
+            ImGui::Checkbox(X("No Spread"), &g_NoSpread);
+            if (g_NoSpread) ImGui::SliderFloat(X("Custom Spread"), &g_CustomSpreadValue, 0.0f, 2.0f, "%.3f");
+            
+            ImGui::Separator();
+            ImGui::Text(X("Visuals / ESP"));
+            ImGui::Checkbox(X("Master ESP Toggle"), &g_EspEnabled);
+            ImGui::Checkbox(X("ESP Box"), &g_EspBox);
+            ImGui::Checkbox(X("ESP Health Bar"), &g_EspHealth);
+            ImGui::Checkbox(X("ESP Names"), &g_EspNames);
+            ImGui::Checkbox(X("ESP Tracers"), &g_EspTracers);
+            ImGui::Checkbox(X("Show Teammates"), &g_EspTeammates);
+            
+            ImGui::Separator();
+            ImGui::Text(X("Weapon Viewmodel"));
+            ImGui::SliderFloat(X("Depth (X)"), &g_VmX, -10.0f, 10.0f);
+            ImGui::SliderFloat(X("Horizontal (Y)"), &g_VmY, -5.0f, 5.0f);
+            ImGui::SliderFloat(X("Vertical (Z)"), &g_VmZ, -5.0f, 5.0f);
+            if (ImGui::Button(X("Reset Viewmodel"))) { g_VmX = 3.50f; g_VmY = 0.20f; g_VmZ = 0.25f; }
+
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== ONE HIT KILL TAB ====================
+        if (ImGui::BeginTabItem(X("One Hit Kill"))) {
+            ImGui::TextColored(ImVec4(1,1,0,1), X("Projectiles Per Shot"));
+            ImGui::Separator();
+            
+            ImGui::Checkbox(X("Enable##ProjectilesPerShot"), &g_ProjectilesPerShotEnabled);
+            if (g_ProjectilesPerShotEnabled) {
+                ImGui::Indent();
+                ImGui::SliderInt(X("Value##PPS"), &g_ProjectilesPerShotValue, 1, 200);
+                ImGui::TextDisabled(X("Test with 99. Watch hit markers."));
+                ImGui::Unindent();
+            }
+            
+            ImGui::Separator();
+            ImGui::TextDisabled(X("Writes the first element of ASGWeapon::ProjectilesPerShot"));
+            ImGui::TextDisabled(X("at weapon + 0x%X (guarded TArray sanity check)."), 
+                                (unsigned)ASGWEAPON_PROJECTILESPERSSHOT);
+            
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== MELEE TAB ====================
+        if (ImGui::BeginTabItem(X("Melee"))) {
+            ImGui::TextColored(ImVec4(1,1,0,1), X("Melee Enhancements"));
+            ImGui::Separator();
+            
+            ImGui::Checkbox(X("Melee Range"), &g_MeleeRange);
+            if (g_MeleeRange) {
+                ImGui::Indent();
+                ImGui::SliderFloat(X("Bounds Scale"), &g_MeleeBoundsScale, 1.0f, 5.0f, "%.2fx");
+                ImGui::Checkbox(X("Wide Hit Angle"), &g_MeleeWideAngle);
+                if (g_MeleeWideAngle) {
+                    ImGui::Indent();
+                    ImGui::SliderFloat(X("Hit Dot"), &g_MeleeHitDot, -1.0f, 1.0f, "%.2f");
+                    ImGui::Unindent();
+                }
+                ImGui::Checkbox(X("Visual Scale (debug)"), &g_MeleeVisualScale);
+
+                ImGui::Separator();
+                ImGui::Checkbox(X("Push Capsule Forward"), &g_MeleePushForward);
+                if (g_MeleePushForward) {
+                    ImGui::Indent();
+                    ImGui::SliderFloat(X("Forward Offset"), &g_MeleeForwardOffset, 0.0f, 10.0f, "%.2f");
+                    ImGui::TextDisabled(X("2.3 is the sweet spot vs players"));
+                    ImGui::Unindent();
+                }
+                ImGui::Unindent();
+            }
+
+            ImGui::Separator();
+            ImGui::Checkbox(X("Fast / Slow Melee (LMB + RMB)"), &g_FastMelee);
+            if (g_FastMelee) {
+                ImGui::Indent();
+                ImGui::SliderFloat(X("Fire Interval (s)"), &g_MeleeFireInterval, 0.01f, 5.0f, "%.3f s", ImGuiSliderFlags_Logarithmic);
+                float rate = (g_MeleeFireInterval > 0.0001f) ? (1.0f / g_MeleeFireInterval) : 0.0f;
+                ImGui::TextDisabled(X("Rate: %.2f swings / second"), rate);
+
+                if (ImGui::SmallButton(X("Slow (2s)")))      g_MeleeFireInterval = 2.0f;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(X("Normal (0.5s)")))  g_MeleeFireInterval = 0.5f;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(X("Fast (0.1s)")))    g_MeleeFireInterval = 0.1f;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(X("Insane (0.01s)"))) g_MeleeFireInterval = 0.01f;
+
+                ImGui::Checkbox(X("Force Next Fire = Now"), &g_FastMeleeForceNextFire);
+                ImGui::Unindent();
+            }
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f,1,1,1), X("Legacy Backstab Mods"));
+            ImGui::Checkbox(X("Enable Legacy Melee"), &g_MeleeEnhanced);
+            if (g_MeleeEnhanced) {
+                ImGui::SliderFloat(X("Backstab Multiplier"), &g_BackstabMultiplier, 1.0f, 100.0f, "%.1fx");
+                ImGui::SliderInt(X("Backstab Angle"), &g_BackstabAngleSlider, 0, 180);
+                ImGui::SliderFloat(X("Reach Multiplier"), &g_MeleeReachMultiplier, 1.0f, 10.0f, "%.1fx");
+            }
+            
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== TEST TAB ====================
+        if (ImGui::BeginTabItem(X("Test"))) {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("Experimental Features"));
+            ImGui::Separator();
+            
+            // Rapid Fire
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Rapid Fire"));
+            ImGui::Checkbox(X("Enable Rapid Fire"), &g_RapidFire);
+            if (g_RapidFire) {
+                ImGui::SliderFloat(X("Fire Rate"), &g_FireRate, 0.001f, 1.0f, "%.3f");
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), X("0.001 = Ultra Fast | 0.05 = Fast | 0.1 = Normal"));
+            }
+            
+            ImGui::Separator();
+            
+            // Infinite Ammo
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Infinite Ammo"));
+            ImGui::Checkbox(X("Enable Infinite Ammo"), &g_InfiniteAmmo);
+            if (g_InfiniteAmmo) {
+                ImGui::TextColored(ImVec4(0, 1, 0, 1), X("Shot cost set to 0 (no ammo consumed)"));
+            }
+            
+            ImGui::Separator();
+            
+            // Defib Legacy
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Defib Enhancements"));
+            ImGui::Checkbox(X("Instant Defib Charge"), &g_InstantDefibCharge);
+            ImGui::Checkbox(X("Max Defib Damage/Revive"), &g_MaxDefibDamage);
+            if (g_MaxDefibDamage) {
+                ImGui::SliderFloat(X("Range Multiplier"), &g_DefibRangeMultiplier, 1.0f, 5.0f, "%.1fx");
+            }
+            
+            ImGui::Separator();
+            
+            // Auto Shoot
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Auto Shoot (Hold Key to Spam)"));
+            ImGui::Checkbox(X("Enable Auto Shoot"), &g_AutoShootEnabled);
+            if (g_AutoShootEnabled) {
+                ImGui::Checkbox(X("Toggle Mode##AutoShoot"), &g_AutoShootToggleMode);
+                ImGui::Checkbox(X("Team Check##AutoShoot"), &g_AutoShootTeamCheck);
+                ImGui::SliderInt(X("Fire Delay (ms)##AutoShoot"), &g_AutoShootDelay, 0, 500);
+                
+                const char* autoShootKeys[] = { "Mouse 4", "Mouse 5", "Left Alt", "Right Alt", "V", "F", "G" };
+                int autoShootKeyCodes[] = { VK_XBUTTON1, VK_XBUTTON2, VK_LMENU, VK_RMENU, 'V', 'F', 'G' };
+                int curAutoShootKey = 0;
+                for(int i=0; i<7; i++) if(g_AutoShootKey == autoShootKeyCodes[i]) { curAutoShootKey = i; break; }
+                if (ImGui::Combo(X("Activation Key##AutoShoot"), &curAutoShootKey, autoShootKeys, 7)) {
+                    g_AutoShootKey = autoShootKeyCodes[curAutoShootKey];
+                }
+            }
+            
+            ImGui::Separator();
+            
+            // Real Triggerbot
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Real Triggerbot (Crosshair Check)"));
+            ImGui::Checkbox(X("Enable Real Triggerbot"), &g_RealTriggerbotEnabled);
+            if (g_RealTriggerbotEnabled) {
+                ImGui::Checkbox(X("Team Check##RealTrigger"), &g_RealTriggerbotTeamCheck);
+                ImGui::SliderInt(X("Reaction Delay (ms)##RealTrigger"), &g_RealTriggerbotDelay, 0, 500);
+                
+                const char* realTriggerKeys[] = { "Mouse 4", "Mouse 5", "Left Alt", "Right Alt", "V" };
+                int realTriggerKeyCodes[] = { VK_XBUTTON1, VK_XBUTTON2, VK_LMENU, VK_RMENU, 'V' };
+                int curRealTriggerKey = 1;
+                for(int i=0; i<5; i++) if(g_RealTriggerbotKey == realTriggerKeyCodes[i]) { curRealTriggerKey = i; break; }
+                if (ImGui::Combo(X("Activation Key##RealTrigger"), &curRealTriggerKey, realTriggerKeys, 5)) {
+                    g_RealTriggerbotKey = realTriggerKeyCodes[curRealTriggerKey];
+                }
+            }
+            
+            ImGui::Separator();
+            
+            // Defib Auto-Revive
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Defib Auto-Revive"));
+            ImGui::Checkbox(X("Enable Defib Auto-Revive"), &g_DefibAutoRevive);
+            if (g_DefibAutoRevive) {
+                ImGui::TextColored(ImVec4(0, 1, 0, 1), X("TP to downed teammate, hold trigger to auto revive"));
+            }
+            
+            ImGui::Separator();
+            if (ImGui::Button(X("Reset All Test Features"), ImVec2(250, 30))) {
+                g_RapidFire = false;
+                g_FireRate = 0.05f;
+                g_InfiniteAmmo = false;
+                g_InstantDefibCharge = false;
+                g_MaxDefibDamage = false;
+                g_DefibRangeMultiplier = 1.0f;
+                g_MeleeEnhanced = false;
+                g_BackstabMultiplier = 10.0f;
+                g_BackstabAngleSlider = 30;
+                g_MeleeReachMultiplier = 1.0f;
+            }
+            
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== TP EXPLOIT TAB ====================
+        if (ImGui::BeginTabItem(X("Teleport Exploit"))) {
+            ImGui::Checkbox(X("Enable TP"), &g_TpEnabled);
+            ImGui::Separator();
+            
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("TP Mode"));
+            const char* tpModes[] = { 
+                "Enemy TP (FOV)", 
+                "Random Enemy", 
+                "Random Downed Teammate", 
+                "Crosshair TP",
+                "Auto Random (on kill)",
+                "Auto Random 2 (timed)"
+            };
+            ImGui::Combo(X("##TpMode"), &g_TpMode, tpModes, 6);
+            
+            if (g_TpMode == 0) {
+                ImGui::TextColored(ImVec4(0.7f, 1, 0.7f, 1), X("Teleports to closest enemy in FOV circle"));
+            } else if (g_TpMode == 1) {
+                ImGui::TextColored(ImVec4(0.7f, 1, 0.7f, 1), X("Teleports to random enemy (anywhere)"));
+                ImGui::Checkbox(X("Include Teammates##tp1"), &g_TpIncludeTeammates);
+            } else if (g_TpMode == 2) {
+                ImGui::TextColored(ImVec4(1, 0.7f, 0.7f, 1), X("Teleports to random downed/incapped teammate"));
+            } else if (g_TpMode == 3) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 1, 1), X("Teleports to exact crosshair location"));
+            } else if (g_TpMode == 4) {
+                ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Auto Random TP (on kill)"));
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), X("TPs to a random player, and as soon as they die,"));
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), X("auto-TPs to the next random player."));
+                ImGui::Checkbox(X("Enable Auto Random TP##ar1"), &g_AutoRandomTpEnabled);
+                ImGui::Checkbox(X("Include Teammates##ar1"), &g_TpIncludeTeammates);
+                
+                ImGui::Separator();
+                ImGui::Text(X("Current target: 0x%llX"), (unsigned long long)g_AutoRandomTpTarget);
+                bool curAlive = ValidPtr(g_AutoRandomTpTarget) ? IsPawnAlive(g_AutoRandomTpTarget) : false;
+                ImGui::TextColored(curAlive ? ImVec4(0,1,0,1) : ImVec4(1,0.5f,0,1),
+                    X("Target alive: %s"), curAlive ? "YES (waiting for kill)" : "NO (will retarget)");
+                ImGui::Text(X("Pool size: %zu"), g_RandomTpPool.size());
+            } else if (g_TpMode == 5) {
+                ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Auto Random TP 2 (timed)"));
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), X("TPs to a different random player every N seconds."));
+                ImGui::Checkbox(X("Enable Auto Random TP 2##ar2"), &g_AutoRandomTp2Enabled);
+                ImGui::SliderFloat(X("Interval##ar2"), &g_AutoRandomTp2Interval, 1.0f, 5.0f, "%.2f s");
+                ImGui::Checkbox(X("Include Teammates##ar2"), &g_TpIncludeTeammates);
+                
+                ImGui::Separator();
+                ImGui::Text(X("Current target: 0x%llX"), (unsigned long long)g_AutoRandomTp2Target);
+                if (g_LastAutoRandomTp2) {
+                    DWORD since = API.GetTickCount() - g_LastAutoRandomTp2;
+                    float nextIn = g_AutoRandomTp2Interval - (since / 1000.0f);
+                    if (nextIn < 0.0f) nextIn = 0.0f;
+                    ImGui::Text(X("Next TP in %.2f s"), nextIn);
+                }
+                ImGui::Text(X("Pool size: %zu"), g_RandomTpPool.size());
+            }
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f,1,1,1), X("AIO TP Behaviour"));
+            ImGui::Checkbox(X("Face Target After TP"), &g_TpFaceTarget);
+            if (g_TpFaceTarget) {
+                ImGui::SliderFloat(X("Aim Height Offset"), &g_TpAimHeightOffset, -30.0f, 100.0f, "%.0f uu");
+                ImGui::TextDisabled(X("0 = feet, 40 = chest, 80 = head"));
+            }
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("TP Settings"));
+            ImGui::SliderFloat(X("TP Cooldown (sec)"), &g_TpCooldown, 0.1f, 5.0f);
+            
+            const char* keys[] = { "Left Click", "Right Click", "Middle Click", "Mouse 4", "Mouse 5", "Shift", "V", "CAPS" };
+            int keyCodes[] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2, VK_SHIFT, 'V', VK_CAPITAL };
+            int curTpK = 1; for(int i=0; i<8; i++) if(g_TpKey == keyCodes[i]) curTpK = i;
+            if (ImGui::Combo(X("TP Key"), &curTpK, keys, 8)) g_TpKey = keyCodes[curTpK];
+            
+            ImGui::Separator();
+            ImGui::Checkbox(X("Show Downed Teammates ESP"), &g_EspDownedTeammates);
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f, 1, 1, 1), X("Debug Info"));
+            ImGui::Text(X("TP Active: %s"), g_TpActive ? "YES" : "NO");
+            ImGui::Text(X("Current TP Target: 0x%llX"), (unsigned long long)g_CurrentTpTarget);
+            ImGui::Text(X("Enemies (all): %zu"), g_AllEnemies.size());
+            ImGui::Text(X("Random TP pool: %zu"), g_RandomTpPool.size());
+            
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== VOTEKICK DODGE TAB (NEW - Linux-style) ====================
+        if (ImGui::BeginTabItem(X("Votekick Dodge"))) {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("Auto Vote-Kick Dodge"));
+            ImGui::TextWrapped(X("Instantly types 'disconnect' into the game console the moment "
+                                 "a vote-kick targeting you is detected."));
+            ImGui::Separator();
+            
+            ImGui::Checkbox(X("Enable Vote-Kick Dodge"), &g_VoteKickDodge);
+            if (g_VoteKickDodge) {
+                ImGui::TextColored(ImVec4(0, 1, 0, 1), X("ACTIVE - You will auto-disconnect when votekicked"));
+            } else {
+                ImGui::TextColored(ImVec4(1, 0, 0, 1), X("DISABLED"));
+            }
+            
+            ImGui::Separator();
+            ImGui::Checkbox(X("Also dodge player-called kicks"), &g_DodgeOnPlayerKick);
+            ImGui::TextDisabled(X("Off = only dodge system/auto kicks (idle, ping, etc.)"));
+            
+            ImGui::Separator();
+            ImGui::Checkbox(X("Show 30s Rejoin Timer"), &g_ShowRejoinTimer);
+            
+            if (g_ShowRejoinTimer) {
+                if (g_DodgeFiredAtTick == 0) {
+                    ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1), X("Rejoin timer idle (no dodge fired yet)"));
+                } else {
+                    DWORD elapsed = API.GetTickCount() - g_DodgeFiredAtTick;
+                    if (elapsed < VOTEKICK_TIMER_MS) {
+                        DWORD remainingMs = VOTEKICK_TIMER_MS - elapsed;
+                        float remainingSec = remainingMs / 1000.0f;
+                        ImGui::TextColored(ImVec4(1,0,0,1), X("Vote kick call still running"));
+                        ImGui::TextColored(ImVec4(1,0.5f,0,1), X("You can rejoin in %.1f s"), remainingSec);
+                        
+                        float prog = 1.0f - (remainingMs / (float)VOTEKICK_TIMER_MS);
+                        if (prog < 0.0f) prog = 0.0f;
+                        if (prog > 1.0f) prog = 1.0f;
+                        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(1,0,0,1));
+                        ImGui::ProgressBar(prog, ImVec2(-1, 18));
+                        ImGui::PopStyleColor();
+                    } else {
+                        ImGui::TextColored(ImVec4(0,1,0,1), X("You can now join again"));
+                        ImGui::ProgressBar(1.0f, ImVec2(-1, 18));
+                    }
+                }
+            }
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f,1,1,1), X("Status"));
+            if (g_VoteKickDodgeFired)
+                ImGui::TextColored(ImVec4(1,0,0,1), X("  FIRED - disconnecting"));
+            else if (g_LastVoteMsg)
+                ImGui::TextColored(ImVec4(1,1,0,1), X("  Vote active (not targeting you)"));
+            else
+                ImGui::TextColored(ImVec4(0,1,0,1), X("  Idle - waiting for a kick vote"));
+            
+            ImGui::Text(X("Active vote obj: 0x%llX"), (unsigned long long)g_LastVoteMsg);
+            ImGui::Text(X("Latch: msg=0x%llX target=%d fired=%s"), 
+                        (unsigned long long)g_LatchedVoteMsg, g_LatchedTargetId,
+                        g_DodgeFiredThisVote ? "yes" : "no");
+            
+            bool kbBlocked = IsConsoleBlockingInput();
+            if (kbBlocked) {
+                DWORD remain = (g_ConsoleBlockUntil > API.GetTickCount()) ? (g_ConsoleBlockUntil - API.GetTickCount()) : 0;
+                ImGui::TextColored(ImVec4(1,0.5f,0,1), X("Keyboard blocked (%.1f s left)"), remain / 1000.0f);
+            } else {
+                ImGui::TextColored(ImVec4(0.5f,1,0.5f,1), X("Keyboard free"));
+            }
+            
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), X("Detection method: Memory scan of PC_ACTIVE_VOTE (0x17C8)"));
+            
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== CHAT & TAGS TAB ====================
+        if (ImGui::BeginTabItem(X("Chat & Tags"))) {
+            ImGui::TextColored(ImVec4(1, 1, 0, 1), X("Chat Spammer & Clan Tag Changer"));
+            ImGui::Separator();
+            
+            // Chat Spammer
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Chat Spammer"));
+            ImGui::Checkbox(X("Enable Chat Spam"), &g_ChatSpammerEnabled);
+            
+            if (g_ChatSpammerEnabled) {
+                ImGui::Checkbox(X("Funny Mode"), &g_ChatSpamFunnyMode);
+                if (!g_ChatSpamFunnyMode) {
+                    ImGui::InputText(X("##ChatMsg"), g_ChatSpamMessage, 256);
+                }
+                ImGui::Checkbox(X("Add Random Prefix/Suffix"), &g_ChatSpamRandomize);
+                ImGui::SliderFloat(X("Spam Delay (seconds)"), &g_ChatSpamDelay, 0.1f, 10.0f, "%.1f");
+                ImGui::Text(X("Messages Sent: %d"), g_ChatSpamCount);
+                if (ImGui::Button(X("Reset Counter"))) g_ChatSpamCount = 0;
+            }
+            
+            ImGui::Separator();
+            ImGui::Separator();
+            
+            // Clan Tag
+            ImGui::TextColored(ImVec4(0, 1, 1, 1), X("Clan Tag Changer"));
+            ImGui::Checkbox(X("Enable Clan Tag Changer"), &g_ClanTagEnabled);
+            
+            if (g_ClanTagEnabled) {
+                ImGui::Checkbox(X("Random Rotation Mode"), &g_ClanTagRandomMode);
+                if (g_ClanTagRandomMode) {
+                    for (int i = 0; i < 10; i++) {
+                        char label[32];
+                        sprintf_s(label, "Tag %d##%d", i + 1, i);
+                        ImGui::InputText(label, g_ClanTagList[i], 32);
+                    }
+                    ImGui::SliderInt(X("Number of Active Tags"), &g_ClanTagCount, 1, 10);
+                    ImGui::SliderFloat(X("Rotation Interval"), &g_ClanTagRotateInterval, 1.0f, 60.0f, "%.1f s");
+                } else {
+                    ImGui::InputText(X("##SingleTag"), g_ClanTagSingle, 32);
+                    if (ImGui::Button(X("Apply Tag Now"))) {
+                        char cmd[64];
+                        sprintf_s(cmd, "setclantag %s", g_ClanTagSingle);
+                        ExecuteConsoleCommand(cmd);
+                    }
+                }
+            }
+            
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== EXPERIMENTAL TAB ====================
+        if (ImGui::BeginTabItem(X("Experimental"))) {
+            ImGui::Text(X("Advanced Weapon Modifications"));
+            ImGui::Separator();
+            ImGui::Checkbox(X("Infinite Long Jump"), &g_InfiniteLongJump);
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== SETTINGS TAB ====================
+        if (ImGui::BeginTabItem(X("Settings"))) {
+            if (ImGui::Button(X("Save Config"), ImVec2(120, 30))) SaveConfig();
+            ImGui::SameLine();
+            if (ImGui::Button(X("Load Config"), ImVec2(120, 30))) LoadConfig();
+            ImGui::Separator();
+            if (ImGui::Button(X("Reset to Defaults"), ImVec2(248, 30))) ResetConfig();
+            ImGui::EndTabItem();
+        }
+        
+        // ==================== DEBUG TAB ====================
+        if (ImGui::BeginTabItem(X("Debug"))) {
+            ImGui::Text(X("Base: 0x%p"), (void*)g_Base);
+            ImGui::Text(X("PC: 0x%p"), (void*)g_PC);
+            ImGui::Text(X("LocalPawn: 0x%p"), (void*)g_LocalPawn);
+            ImGui::Text(X("Offsets: H:%X C:%X M:%X"), g_HudOffset, g_CanvasOffset, g_CanvasMatrixOffset);
+            ImGui::Separator();
+            ImGui::Text(X("ESP Pawn Iterations: %d"), g_DebugPawnCount);
+            ImGui::Text(X("Cached ESP: %d"), (int)g_PawnCache.size());
+            ImGui::TextColored(g_ViewProjValid ? ImVec4(0,1,0,1) : ImVec4(1,0,0,1), 
+                X("ViewProj Matrix: %s"), g_ViewProjValid ? "VALID" : "INVALID");
+            ImGui::Separator();
+            ImGui::TextColored(oProcessEvent ? ImVec4(0, 1, 0, 1) : ImVec4(1, 0, 0, 1), 
+                X("ProcessEvent Hook: %s"), oProcessEvent ? "ACTIVE" : "FAILED");
+            ImGui::Text(X("YawOff: 0x%X"), g_YawOff);
+            
+            if (ImGui::Button(X("Copy Debug Info"))) {
+                char buf[1024];
+                sprintf_s(buf, "Base: 0x%p\nPC: 0x%p\nPawn: 0x%p\nYawOff: 0x%X\nEnemies: %zu\nTP Pool: %zu",
+                    (void*)g_Base, (void*)g_PC, (void*)g_LocalPawn, g_YawOff, g_AllEnemies.size(), g_RandomTpPool.size());
+                ImGui::SetClipboardText(buf);
+            }
+            
+            ImGui::EndTabItem();
+        }
+    }
+    ImGui::EndTabBar(); 
+    ImGui::End();
+}
+
+// ==================== WNDPROC ====================
+
+LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == VK_INSERT) { 
+        g_ShowMenu = !g_ShowMenu; 
+        return 0; 
+    }
+    
+    // Block keyboard input during console command execution
+    bool blockKeyboard = g_ConsoleBusy || 
+                         (g_ConsoleBlockUntil != 0 && GetTickCount() < g_ConsoleBlockUntil);
+    
+    if (blockKeyboard) {
+        switch (m) {
+            case WM_KEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYDOWN:
+            case WM_SYSKEYUP:
+            case WM_CHAR:
+            case WM_DEADCHAR:
+            case WM_SYSCHAR:
+                if (w == VK_OEM_3) break;
+                return 0;
+        }
+    }
+    
+    if (g_ShowMenu) { 
+        ImGui_ImplWin32_WndProcHandler(h,m,w,l); 
+        return 1; 
+    }
+    return CallWindowProc(oWndProc, h, m, w, l);
+}
+
+// ==================== PRESENT HOOK ====================
+
+HRESULT WINAPI hkPresent(IDirect3DDevice9* d, const RECT* s, const RECT* dt, HWND hw, const RGNDATA* r) {
+    if (!g_ImguiInit) {
+        g_Device = d; 
+        D3DDEVICE_CREATION_PARAMETERS cp; 
+        d->GetCreationParameters(&cp);
+        oWndProc = (WNDPROC)SetWindowLongPtr(cp.hFocusWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
+        ImGui::CreateContext(); 
+        ImGui_ImplWin32_Init(cp.hFocusWindow); 
+        ImGui_ImplDX9_Init(d);
+        g_ImguiInit = true;
+    }
+    ImGui_ImplDX9_NewFrame(); 
+    ImGui_ImplWin32_NewFrame(); 
+    ImGui::NewFrame();
+    ImGui::GetIO().MouseDrawCursor = g_ShowMenu;
+    RunEngineLogic(); 
+    DrawESP(); 
+    DrawMenu();
+    ImGui::EndFrame(); 
+    ImGui::Render(); 
+    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    return oPresent(d, s, dt, hw, r);
+}
+
+// ==================== MAIN THREAD ====================
+
+DWORD WINAPI MainThread(LPVOID lp) {
+    ResolveAPIs();
+    API.Sleep(1000);
+    g_Base = GetModuleBaseManual(NULL); 
+    LoadConfig();
+    MH_Initialize();
+    
+    // Hook ProcessEvent
+    int retries = 0;
+    while (retries++ < 50) {
+        uintptr_t gobjects = *(uintptr_t*)(g_Base + 0x2207330);
+        if (ValidPtr(gobjects)) {
+            uintptr_t firstObject = *(uintptr_t*)gobjects;
+            if (ValidPtr(firstObject)) {
+                uintptr_t vtable = *(uintptr_t*)firstObject;
+                if (ValidPtr(vtable)) {
+                    uintptr_t processEventAddr = *(uintptr_t*)(vtable + 0x218);
+                    if (ValidPtr(processEventAddr)) {
+                        MH_CreateHook((LPVOID)processEventAddr, &hkProcessEvent, (LPVOID*)&oProcessEvent);
+                        break;
+                    }
+                }
+            }
+        }
+        API.Sleep(100);
+    }
+    
+    // Hook D3D9 Present
+    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    D3DPRESENT_PARAMETERS dp = {0}; 
+    dp.Windowed = TRUE; 
+    dp.SwapEffect = D3DSWAPEFFECT_DISCARD; 
+    dp.hDeviceWindow = GetForegroundWindow();
+    IDirect3DDevice9* dev = NULL; 
+    pD3D->CreateDevice(0, D3DDEVTYPE_HAL, dp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &dp, &dev);
+    MH_CreateHook((*(void***)dev)[17], &hkPresent, (LPVOID*)&oPresent); 
+    MH_EnableHook(MH_ALL_HOOKS);
+    dev->Release(); 
+    pD3D->Release();
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID l) { 
+    if (r == 1) CreateThread(0,0,MainThread,0,0,0); 
+    return 1; 
+}
